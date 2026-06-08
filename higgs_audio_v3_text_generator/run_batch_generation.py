@@ -159,7 +159,7 @@ def main():
                     print(f"Task {task.get('task_id', '?')} failed: {e}")
                     failed += 1
 
-                if (completed + failed) % 10 == 0:
+                if (completed + failed) % 1 == 0:
                     elapsed = time.time() - start_time
                     rate = len(all_texts) / max(1, elapsed)
                     print(
