@@ -1,5 +1,6 @@
 """
-Task generation via stratified random sampling.
+Task generation with guaranteed subscene/emotion/length coverage.
+Each consecutive 3-tasks within same scenario must cover different subscenes.
 """
 
 import random
@@ -41,25 +42,56 @@ def generate_task_list(config: GenConfig) -> List[Dict]:
     lang_total = sum(lang_weights)
     lang_probs = [w / lang_total for w in lang_weights]
 
-    subscene_indices = {}
-    for key in scenario_keys:
-        subscene_indices[key] = 0
+    # Track last N subscenes per scenario to ensure variety
+    subscene_recent = {key: [] for key in scenario_keys}
+    emotion_recent = {key: [] for key in scenario_keys}
 
     for _ in range(num_regular):
         scenario_key = rng.choices(scenario_keys, weights=scenario_probs, k=1)[0]
         scenario = regular_scenarios[scenario_key]
 
         subscenes = scenario.get("subscenes", [scenario["name"]])
-        subscene = subscenes[subscene_indices[scenario_key] % len(subscenes)]
-        subscene_indices[scenario_key] += 1
+        n_subs = len(subscenes)
+        recent = subscene_recent[scenario_key]
+        # Pick least recently used subscene (enforce 3+ different per consecutive)
+        if len(recent) >= 3 and n_subs > 1:
+            used = set(recent[-3:])
+            available = [s for s in subscenes if s not in used]
+            if not available:
+                available = subscenes
+            subscene = rng.choice(available)
+        elif n_subs > 1:
+            available = [s for s in subscenes if s not in recent]
+            if not available:
+                available = subscenes
+            subscene = rng.choice(available)
+        else:
+            subscene = subscenes[0]
+        subscene_recent[scenario_key].append(subscene)
+        if len(subscene_recent[scenario_key]) > 10:
+            subscene_recent[scenario_key] = subscene_recent[scenario_key][-10:]
 
-        emotion_weights_dict = scenario.get("typical_emotions", {})
-        emotion_list = list(emotion_weights_dict.keys())
-        emotion_weights_val = list(emotion_weights_dict.values())
-        if not emotion_list:
-            emotion_list = EMOTIONS[:]
-            emotion_weights_val = [1.0] * len(emotion_list)
-        emotion = rng.choices(emotion_list, weights=emotion_weights_val, k=1)[0]
+        # Emotion: rotate through scenario-typical emotions for coverage
+        emo_weights = scenario.get("typical_emotions", {})
+        if emo_weights:
+            emo_list = list(emo_weights.keys())
+            emo_w = list(emo_weights.values())
+            # Avoid repeating same emotion 3 times in a row
+            emo_recent = emotion_recent[scenario_key]
+            if len(emo_recent) >= 2 and len(emo_list) > 1:
+                used = set(emo_recent[-2:])
+                filtered = [(e, w) for e, w in zip(emo_list, emo_w) if e not in used]
+                if not filtered:
+                    filtered = list(zip(emo_list, emo_w))
+                el2, ew2 = zip(*filtered)
+                emotion = rng.choices(list(el2), weights=list(ew2), k=1)[0]
+            else:
+                emotion = rng.choices(emo_list, weights=emo_w, k=1)[0]
+            emotion_recent[scenario_key].append(emotion)
+            if len(emotion_recent[scenario_key]) > 10:
+                emotion_recent[scenario_key] = emotion_recent[scenario_key][-10:]
+        else:
+            emotion = rng.choice(EMOTIONS)
 
         length_key = rng.choices(length_keys, weights=length_probs, k=1)[0]
         lang_key = rng.choices(lang_keys, weights=lang_probs, k=1)[0]
