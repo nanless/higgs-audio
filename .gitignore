@@ -199,3 +199,14 @@ result/
 
 # Ruff
 .ruff_cache/
+
+child_voice_clone_output_higgs
+
+higgs_v3_env/
+
+# Generated audio files
+*.wav
+
+# Higgs Audio v3 text generator outputs and env
+higgs_audio_v3_text_generator/batch_output/
+higgs_audio_v3_text_generator/.env
