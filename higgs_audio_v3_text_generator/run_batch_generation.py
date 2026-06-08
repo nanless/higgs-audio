@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
 """
-Batch text generation pipeline for Higgs Audio v3 TTS.
-Orchestrates concurrent LLM calls, deduplication, quality filtering,
-and final output.
-
-Usage:
-    python run_batch_generation.py --total 10000 --workers 10
-    python run_batch_generation.py --total 50000 --workers 16 --output my_texts.jsonl
+Batch text generation pipeline for Higgs Audio v3 TTS via vLLM API.
+Uses ThreadPoolExecutor for concurrent requests + diversity compact prompt.
 """
 
 import argparse
 import os
+import re
 import sys
 import time
 import threading
+import json
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from higgs_text_gen.config import GenConfig
 from higgs_text_gen.task_generator import generate_task_list
-from higgs_text_gen.worker import worker
-from higgs_text_gen.dedup import (
-    deduplicate, semantic_deduplicate, build_duplicate_index,
-    filter_incremental_duplicates,
-)
-from higgs_text_gen.quality_filter import quality_filter
+from higgs_text_gen.compact_prompt import build_compact_prompt
+from higgs_text_gen.llm_client import call_llm
+from higgs_text_gen.text_clean import attach_clean_text_batch
+from higgs_text_gen.dedup import deduplicate, semantic_deduplicate, build_duplicate_index
 from higgs_text_gen.checkpoint import save_checkpoint, load_checkpoint
 from higgs_text_gen.output import save_jsonl, print_statistics
+from higgs_text_gen.quality_filter import quality_filter
+
+HIGGS_TAG_CLEAN_RE = re.compile(r"<\|(emotion|style|sfx|prosody):[a-z_]+\|>")
+
+
+def _normalize_for_dedup(text):
+    t = HIGGS_TAG_CLEAN_RE.sub("", text)
+    t = re.sub(r"\d+", "<NUM>", t)
+    t = re.sub(r"[^\w\s]", "", t.lower().strip())
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def build_suppression_hint(texts, window_size=500):
@@ -44,168 +48,179 @@ def build_suppression_hint(texts, window_size=500):
     overused = [k for k, v in char_counter.most_common(10) if v >= max(4, len(recent) // 80)]
     if not overused:
         return ""
-
-    hints = ["\n=== 频率抑制提示 ==="]
-    hints.append("最近生成中以下开头被过度使用，请避免:")
-    for i, opening in enumerate(overused[:5]):
-        hints.append(f"  {i+1}. 避免以 '{opening}' 开头的句子")
+    hints = ["避免以下重复开头:"]
+    for i, o in enumerate(overused[:5]):
+        hints.append(f"  避免'{o}'开头")
     return "\n".join(hints)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Batch text generation for Higgs Audio v3 TTS")
-    parser.add_argument("--total", type=int, default=10000, help="Total target texts")
-    parser.add_argument("--batch-size", type=int, default=8, help="Texts per LLM call")
-    parser.add_argument("--workers", type=int, default=10, help="Concurrent LLM workers")
-    parser.add_argument("--model", type=str, default=None, help="LLM model name")
-    parser.add_argument("--base-url", type=str, default=None, help="LLM API base URL")
-    parser.add_argument("--api-key", type=str, default=None, help="LLM API key")
-    parser.add_argument("--temperature", type=float, default=0.85, help="LLM temperature")
-    parser.add_argument("--output", type=str, default="batch_output/generated_texts.jsonl",
-                        help="Output JSONL path")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed")
-    parser.add_argument("--stress-ratio", type=float, default=0.10,
-                        help="Stress test ratio")
-    parser.add_argument("--checkpoint", type=str, default="batch_output/.checkpoint.jsonl",
-                        help="Checkpoint path")
-    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
-    parser.add_argument("--no-quality-filter", action="store_true",
-                        help="Skip quality filter (raw output)")
+def worker_fn(task, config):
+    import random
+    task_id = task.get("task_id")
+    scenario_key = task["scenario_key"]
+    emotion = task.get("emotion", "contentment")
 
+    prompt = build_compact_prompt(
+        scenario_key=scenario_key,
+        subscene=task.get("subscene", ""),
+        length_key=task.get("length_key", "medium"),
+        lang_key=task.get("lang_key", "pure_cn"),
+        emotion=emotion,
+        batch_size=config.batch_size,
+        suppression_hint=task.get("suppression_hint", ""),
+        task_id=task_id or 0,
+    )
+
+    seed = hash(f"{task_id}|{scenario_key}|{emotion}") & 0xFFFFFFFF
+    rng = random.Random(seed)
+    temp = min(1.0, max(0.65, config.temperature + rng.uniform(-0.15, 0.15)))
+
+    results = call_llm(
+        prompt=prompt, model=config.model, api_key=config.api_key,
+        base_url=config.base_url, max_retries=config.max_retries,
+        retry_base_delay=config.retry_base_delay,
+        max_tokens=config.max_tokens, temperature=temp,
+    )
+
+    if not results:
+        return None
+
+    for item in results:
+        item["task_id"] = task_id
+        item["scenario"] = item.get("scenario", scenario_key)
+        item["subscene"] = item.get("subscene", task.get("subscene", ""))
+        item["emotion"] = item.get("emotion", emotion)
+        item["length_type"] = item.get("length_type", task.get("length_key", "medium"))
+        item["lang_type"] = item.get("lang_type", task.get("lang_key", "pure_cn"))
+        lt = item.get("lang_type", "")
+        item["language"] = item.get("language", "zh" if "cn" in lt else "en")
+
+    if config.generate_clean_text:
+        attach_clean_text_batch(results)
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--total", type=int, default=500)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--base-url", type=str, default=None)
+    parser.add_argument("--api-key", type=str, default=None)
+    parser.add_argument("--temperature", type=float, default=0.85)
+    parser.add_argument("--output", type=str, default="batch_output/generated_texts.jsonl")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--checkpoint", type=str, default="batch_output/.checkpoint.jsonl")
     args = parser.parse_args()
 
     config = GenConfig(
-        total_target=args.total,
-        batch_size=args.batch_size,
+        total_target=args.total, batch_size=args.batch_size,
         max_workers=args.workers,
         model=args.model or os.environ.get("LLM_MODEL", "qwen3.6-27b"),
         base_url=args.base_url or os.environ.get("LLM_BASE_URL", "http://localhost:8000"),
-        api_key=args.api_key or os.environ.get("LLM_API_KEY"),
+        api_key=args.api_key or os.environ.get("LLM_API_KEY", "EMPTY"),
         temperature=args.temperature,
-        stress_test_ratio=args.stress_ratio,
         seed=args.seed or int(time.time()),
         output_dir=os.path.dirname(args.output) or "batch_output",
     )
 
-    print(f"Config: target={config.total_target}, batch_size={config.batch_size}, "
-          f"workers={config.max_workers}, seed={config.seed}")
-    print(f"Model: {config.model}")
-    print(f"Output: {args.output}")
-    print(f"Checkpoint: {args.checkpoint}")
-    print()
+    print(f"Config: total={config.total_target} batch={config.batch_size} "
+          f"workers={config.max_workers} seed={config.seed}")
+    print(f"Model: {config.model}  Base: {config.base_url}")
 
-    output_jsonl = args.output
-    checkpoint_path = args.checkpoint
-
-    if args.resume:
-        all_texts = load_checkpoint(checkpoint_path)
-        print(f"Resumed {len(all_texts)} texts from checkpoint")
-    else:
-        all_texts = []
-
-    seen_normalized, duplicate_context_index = build_duplicate_index(all_texts)
+    all_texts = load_checkpoint(args.checkpoint)
+    print(f"Loaded {len(all_texts)} from checkpoint")
 
     tasks = generate_task_list(config)
-    total_tasks = len(tasks)
-    print(f"Total tasks: {total_tasks} (batch_size={config.batch_size}, target={config.total_target})")
+    completed_ids = {t.get("task_id", -1) for t in all_texts}
+    pending = [t for t in tasks if t["task_id"] not in completed_ids]
+    print(f"Tasks: {len(tasks)} total, {len(pending)} pending")
 
-    completed_task_ids = {t.get("task_id", -1) for t in all_texts}
-    pending_tasks = [t for t in tasks if t["task_id"] not in completed_task_ids]
-    print(f"Pending tasks: {len(pending_tasks)}")
+    if not pending:
+        print("All done!")
+        return
 
-    if not pending_tasks:
-        print("All tasks completed!")
-    else:
-        completed = 0
-        failed = 0
-        skipped_duplicates = 0
-        start_time = time.time()
-        lock = threading.Lock()
+    lock = threading.Lock()
+    seen_norm = set()
+    for item in all_texts:
+        seen_norm.add(_normalize_for_dedup(item.get("text", "")))
 
-        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-            future_to_task = {}
-            next_task_idx = 0
+    completed = 0
+    failed = 0
+    skipped = 0
+    start_time = time.time()
 
-            def submit_next():
-                nonlocal next_task_idx
-                with lock:
-                    if next_task_idx >= len(pending_tasks):
-                        return
-                    task = dict(pending_tasks[next_task_idx])
-                    next_task_idx += 1
-                task["suppression_hint"] = build_suppression_hint(
-                    all_texts, config.suppression_window_size
-                )
-                future = executor.submit(worker, task, config)
-                future_to_task[future] = task
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+        future_to_idx = {}
+        next_idx = 0
 
-            for _ in range(min(config.max_workers, len(pending_tasks))):
-                submit_next()
+        def submit():
+            nonlocal next_idx, all_texts
+            if next_idx >= len(pending):
+                return
+            task = dict(pending[next_idx])
+            task["suppression_hint"] = build_suppression_hint(all_texts, config.suppression_window_size)
+            future = executor.submit(worker_fn, task, config)
+            future_to_idx[future] = next_idx
+            next_idx += 1
 
-            while future_to_task:
-                for future in as_completed(list(future_to_task)):
-                    task = future_to_task.pop(future)
-                    break
-                try:
-                    results = future.result(timeout=180)
-                    if results:
-                        with lock:
-                            results, skipped = filter_incremental_duplicates(
-                                results, seen_normalized, duplicate_context_index,
-                                same_context_threshold=config.same_context_dup_threshold,
-                            )
-                            skipped_duplicates += skipped
-                            all_texts.extend(results)
-                            completed += 1
-                    else:
-                        with lock:
-                            failed += 1
-                except Exception as e:
-                    print(f"Task {task.get('task_id', '?')} failed: {e}")
+        for _ in range(min(config.max_workers, len(pending))):
+            submit()
+
+        while future_to_idx:
+            for future in as_completed(list(future_to_idx)):
+                idx = future_to_idx.pop(future)
+                break
+            try:
+                results = future.result(timeout=180)
+                if results:
+                    with lock:
+                        new_items = []
+                        for item in results:
+                            norm = _normalize_for_dedup(item.get("text", ""))
+                            if norm in seen_norm:
+                                skipped += 1
+                                continue
+                            seen_norm.add(norm)
+                            new_items.append(item)
+                        all_texts.extend(new_items)
+                        completed += 1
+                else:
                     with lock:
                         failed += 1
+            except Exception as e:
+                print(f"Task {idx} err: {e}")
+                with lock:
+                    failed += 1
 
-                if (completed + failed) % 5 == 0:
-                    with lock:
-                        elapsed = time.time() - start_time
-                        rate = len(all_texts) / max(1, elapsed)
-                        print(
-                            f"[{completed+failed}/{len(pending_tasks)}] "
-                            f"ok={completed} fail={failed} total_texts={len(all_texts)} "
-                            f"skipped={skipped_duplicates} rate={rate:.1f} texts/s"
-                        )
-                        save_checkpoint(all_texts, checkpoint_path)
+            with lock:
+                if completed > 0 and completed % 5 == 0:
+                    elapsed = time.time() - start_time
+                    rate = len(all_texts) / max(1, elapsed)
+                    print(f"[{completed}/{len(pending)}] ok={completed} fail={failed} "
+                          f"texts={len(all_texts)} skip={skipped} rate={rate:.1f} t/s")
+                    save_checkpoint(all_texts, args.checkpoint)
 
-                submit_next()
+            submit()
 
-        save_checkpoint(all_texts, checkpoint_path)
-        elapsed = time.time() - start_time
-        print(f"\nGeneration complete: {completed} ok, {failed} failed, "
-              f"{len(all_texts)} texts in {elapsed:.1f}s")
+    save_checkpoint(all_texts, args.checkpoint)
+    elapsed = time.time() - start_time
+    print(f"\nDone: {completed} ok {failed} fail {len(all_texts)} texts in {elapsed:.1f}s "
+          f"({len(all_texts)/max(1,elapsed):.1f} t/s)")
 
-    print(f"\nPost-processing {len(all_texts)} texts...")
-
+    print(f"\nPost-processing...")
     all_texts = deduplicate(all_texts)
     print(f"After exact dedup: {len(all_texts)}")
-
     all_texts = semantic_deduplicate(all_texts, threshold=config.semantic_dedup_threshold)
     print(f"After semantic dedup: {len(all_texts)}")
+    all_texts = quality_filter(all_texts, max_tags_per_text=config.max_tags_per_text,
+                                max_same_tag_repeat=config.max_same_tag_repeat)
+    print(f"After quality: {len(all_texts)}")
 
-    raw_snapshot_path = args.output.replace(".jsonl", ".raw.jsonl")
-    save_jsonl(all_texts, raw_snapshot_path)
-    print(f"Raw snapshot saved to {raw_snapshot_path}")
-
-    if not args.no_quality_filter:
-        all_texts = quality_filter(
-            all_texts,
-            max_tags_per_text=config.max_tags_per_text,
-            max_same_tag_repeat=config.max_same_tag_repeat,
-        )
-        print(f"After quality filter: {len(all_texts)}")
-
-    save_jsonl(all_texts, output_jsonl)
-    print(f"\nFinal output saved to {output_jsonl}")
-
+    save_jsonl(all_texts, args.output)
+    print(f"\nSaved {len(all_texts)} -> {args.output}")
     print_statistics(all_texts)
 
 

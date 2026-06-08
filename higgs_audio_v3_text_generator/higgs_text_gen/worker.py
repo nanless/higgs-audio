@@ -1,6 +1,5 @@
 """
-Worker for vLLM API text generation (optimized).
-Uses compact prompt + OpenAI-compatible vLLM API.
+Worker for vLLM API text generation (diversity optimized).
 """
 
 import random
@@ -24,12 +23,13 @@ def worker(task: Dict, config: GenConfig) -> List[Dict]:
         lang_key=task.get("lang_key", "pure_cn"),
         emotion=emotion,
         batch_size=config.batch_size,
+        suppression_hint=task.get("suppression_hint", ""),
         task_id=task_id or 0,
     )
 
     seed = hash(f"{task_id}|{scenario_key}|{emotion}") & 0xFFFFFFFF
     rng = random.Random(seed)
-    batch_temperature = min(1.0, max(0.7, config.temperature + rng.uniform(-0.08, 0.12)))
+    batch_temperature = min(1.0, max(0.65, config.temperature + rng.uniform(-0.15, 0.15)))
 
     results = call_llm(
         prompt=prompt,
