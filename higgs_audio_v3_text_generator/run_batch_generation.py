@@ -113,6 +113,8 @@ def main():
     parser.add_argument("--output", type=str, default="batch_output/generated_texts.jsonl")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--checkpoint", type=str, default="batch_output/.checkpoint.jsonl")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--no-postprocess", action="store_true", help="Skip final dedup/quality for speed")
     args = parser.parse_args()
 
     config = GenConfig(
@@ -130,7 +132,7 @@ def main():
           f"workers={config.max_workers} seed={config.seed}")
     print(f"Model: {config.model}  Base: {config.base_url}")
 
-    all_texts = load_checkpoint(args.checkpoint)
+    all_texts = load_checkpoint(args.checkpoint) if args.resume else []
     print(f"Loaded {len(all_texts)} from checkpoint")
 
     tasks = generate_task_list(config)
@@ -210,17 +212,18 @@ def main():
     print(f"\nDone: {completed} ok {failed} fail {len(all_texts)} texts in {elapsed:.1f}s "
           f"({len(all_texts)/max(1,elapsed):.1f} t/s)")
 
-    print(f"\nPost-processing...")
-    all_texts = deduplicate(all_texts)
-    print(f"After exact dedup: {len(all_texts)}")
-    all_texts = semantic_deduplicate(all_texts, threshold=config.semantic_dedup_threshold)
-    print(f"After semantic dedup: {len(all_texts)}")
-    all_texts = quality_filter(all_texts, max_tags_per_text=config.max_tags_per_text,
-                                max_same_tag_repeat=config.max_same_tag_repeat)
-    print(f"After quality: {len(all_texts)}")
+    if not args.no_postprocess:
+        print(f"\nPost-processing...")
+        all_texts = deduplicate(all_texts)
+        print(f"After exact dedup: {len(all_texts)}")
+        all_texts = semantic_deduplicate(all_texts, threshold=config.semantic_dedup_threshold)
+        print(f"After semantic dedup: {len(all_texts)}")
+        all_texts = quality_filter(all_texts, max_tags_per_text=config.max_tags_per_text,
+                                    max_same_tag_repeat=config.max_same_tag_repeat)
+        print(f"After quality: {len(all_texts)}")
 
     save_jsonl(all_texts, args.output)
-    print(f"\nSaved {len(all_texts)} -> {args.output}")
+    print(f"Saved {len(all_texts)} -> {args.output}")
     print_statistics(all_texts)
 
 

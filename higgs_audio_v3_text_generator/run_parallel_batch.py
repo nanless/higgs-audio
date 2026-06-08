@@ -50,6 +50,8 @@ def main():
             "--seed", str(seed),
             "--output", output,
             "--checkpoint", checkpoint,
+            "--resume",
+            "--no-postprocess",
         ]
 
         print(f"Instance {i}: port {port} -> {output}")
