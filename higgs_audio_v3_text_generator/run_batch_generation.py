@@ -13,6 +13,7 @@ import argparse
 import os
 import sys
 import time
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -119,6 +120,7 @@ def main():
         failed = 0
         skipped_duplicates = 0
         start_time = time.time()
+        lock = threading.Lock()
 
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
             future_to_task = {}
@@ -126,15 +128,16 @@ def main():
 
             def submit_next():
                 nonlocal next_task_idx
-                if next_task_idx >= len(pending_tasks):
-                    return
-                task = dict(pending_tasks[next_task_idx])
+                with lock:
+                    if next_task_idx >= len(pending_tasks):
+                        return
+                    task = dict(pending_tasks[next_task_idx])
+                    next_task_idx += 1
                 task["suppression_hint"] = build_suppression_hint(
                     all_texts, config.suppression_window_size
                 )
                 future = executor.submit(worker, task, config)
                 future_to_task[future] = task
-                next_task_idx += 1
 
             for _ in range(min(config.max_workers, len(pending_tasks))):
                 submit_next()
@@ -146,28 +149,32 @@ def main():
                 try:
                     results = future.result(timeout=180)
                     if results:
-                        results, skipped = filter_incremental_duplicates(
-                            results, seen_normalized, duplicate_context_index,
-                            same_context_threshold=config.same_context_dup_threshold,
-                        )
-                        skipped_duplicates += skipped
-                        all_texts.extend(results)
-                        completed += 1
+                        with lock:
+                            results, skipped = filter_incremental_duplicates(
+                                results, seen_normalized, duplicate_context_index,
+                                same_context_threshold=config.same_context_dup_threshold,
+                            )
+                            skipped_duplicates += skipped
+                            all_texts.extend(results)
+                            completed += 1
                     else:
-                        failed += 1
+                        with lock:
+                            failed += 1
                 except Exception as e:
                     print(f"Task {task.get('task_id', '?')} failed: {e}")
-                    failed += 1
+                    with lock:
+                        failed += 1
 
-                if (completed + failed) % 1 == 0:
-                    elapsed = time.time() - start_time
-                    rate = len(all_texts) / max(1, elapsed)
-                    print(
-                        f"[{completed+failed}/{len(pending_tasks)}] "
-                        f"ok={completed} fail={failed} total_texts={len(all_texts)} "
-                        f"skipped={skipped_duplicates} rate={rate:.1f} texts/s"
-                    )
-                    save_checkpoint(all_texts, checkpoint_path)
+                if (completed + failed) % 5 == 0:
+                    with lock:
+                        elapsed = time.time() - start_time
+                        rate = len(all_texts) / max(1, elapsed)
+                        print(
+                            f"[{completed+failed}/{len(pending_tasks)}] "
+                            f"ok={completed} fail={failed} total_texts={len(all_texts)} "
+                            f"skipped={skipped_duplicates} rate={rate:.1f} texts/s"
+                        )
+                        save_checkpoint(all_texts, checkpoint_path)
 
                 submit_next()
 

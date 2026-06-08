@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from higgs_text_gen.config import GenConfig
-from higgs_text_gen.prompt_builder import build_prompt
+from higgs_text_gen.compact_prompt import build_compact_prompt
 from higgs_text_gen.llm_client import call_llm
 from higgs_text_gen.text_clean import attach_clean_text_batch
 from higgs_text_gen.scenarios import SCENARIOS, EMOTIONS, LENGTH_SPECS, LANG_MIX_SPECS
@@ -94,14 +94,13 @@ def main():
     print(f"  Language: {args.lang}")
     print()
 
-    prompt = build_prompt(
+    prompt = build_compact_prompt(
         scenario_key=args.scenario,
         subscene=subscene,
         length_key=args.length,
         lang_key=args.lang,
         emotion=args.emotion,
         batch_size=args.count,
-        suppression_hint="",
         task_id=0,
     )
 
