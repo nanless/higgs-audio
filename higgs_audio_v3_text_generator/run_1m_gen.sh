@@ -1,8 +1,10 @@
 #!/bin/bash
-# Start 1M text generation in tmux session
+# Start 1M text generation with optimized Higgs v3 pipeline in tmux session
+# batch_size=8 to fit 4096 token context with full tag guide
 # Usage: bash run_1m_gen.sh
 
-SESSION="higgs_1m_gen"
+SESSION="higgs_1m_gen_v2"
+OUTDIR="batch_output_v2"
 
 # Check if session already exists
 if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -13,21 +15,23 @@ fi
 
 cd /root/code/github_repos/higgs-audio/higgs_audio_v3_text_generator
 
-# Clean old partial outputs
-rm -f batch_output/.checkpoint_w*.jsonl batch_output/generated_texts_w*.jsonl
+# Prepare output directory
+mkdir -p "$OUTDIR"
+rm -f "$OUTDIR"/.checkpoint_w*.jsonl "$OUTDIR"/generated_texts_w*.jsonl
 
 # Create tmux session with 2 panes: generation + monitoring
 tmux new-session -d -s "$SESSION" -n "gen"
 tmux send-keys -t "$SESSION:gen" \
-  "/root/miniforge3/envs/higgs_audio_env/bin/python -u run_parallel_batch.py \
-  --total 1000000 --batch-size 16 --workers 8 --num-instances 4 \
+  "python3 -u run_parallel_batch.py \
+  --total 1000000 --batch-size 8 --workers 8 --num-instances 4 \
   --temperature 0.85 --seed 42 \
+  --output-dir $OUTDIR \
   2>&1 | tee /tmp/higgs_1m_gen.log" C-m
 
 # Monitoring pane
 tmux split-window -h -t "$SESSION:gen"
 tmux send-keys -t "$SESSION:gen.1" \
-  "watch -n 30 'echo \"=== Time: \$(date) ===\" && wc -l batch_output/.checkpoint_w*.jsonl 2>/dev/null && echo \"---\" && tail -5 /tmp/higgs_1m_gen.log | grep -E \"texts=|Done|error\" && echo \"---\" && nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader'" C-m
+  "watch -n 30 'echo \"=== Time: \$(date) ===\" && wc -l ${OUTDIR}/.checkpoint_w*.jsonl 2>/dev/null && echo \"---\" && tail -5 /tmp/higgs_1m_gen.log | grep -E \"texts=|Done|error\" && echo \"---\" && nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader'" C-m
 
 echo "Tmux session '$SESSION' started."
 echo "  Attach: tmux attach -t $SESSION"
@@ -35,8 +39,8 @@ echo "  Detach: Ctrl+B D"
 echo "  Kill:   tmux kill-session -t $SESSION"
 echo "  Log:    tail -f /tmp/higgs_1m_gen.log"
 echo ""
-echo "Estimated time for 1M texts: ~46 hours (~6 texts/s sustained)"
-echo "Checkpoints saved to batch_output/.checkpoint_w*.jsonl every 5 batches"
+echo "Estimated time for 1M texts: ~40 hours (1.25M batches × bsize=8 ≈ 7 texts/s)"
+echo "Checkpoints saved to ${OUTDIR}/.checkpoint_w*.jsonl every 5 batches"
 echo ""
 echo "To resume after crash:"
 echo "  tmux kill-session -t $SESSION"

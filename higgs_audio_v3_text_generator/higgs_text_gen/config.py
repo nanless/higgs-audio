@@ -6,7 +6,7 @@ from typing import Dict, Optional
 @dataclass
 class GenConfig:
     total_target: int = 10000
-    batch_size: int = 16
+    batch_size: int = 8
     max_workers: int = 1
 
     scenario_distribution: Dict[str, float] = field(default_factory=lambda: {
@@ -35,7 +35,7 @@ class GenConfig:
     api_key: Optional[str] = None
     base_url: str = os.environ.get("LLM_BASE_URL", "http://localhost:8000")
     temperature: float = 0.85
-    max_tokens: int = 2048
+    max_tokens: int = 1536
     max_retries: int = 3
     retry_base_delay: float = 1.0
 

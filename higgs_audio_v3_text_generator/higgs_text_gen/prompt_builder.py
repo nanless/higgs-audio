@@ -7,15 +7,14 @@ import hashlib
 import random
 from typing import Optional
 
-from .scenarios import (
-    SCENARIOS, EMOTION_PROFILES, TAG_DENSITY_MAP,
-    LENGTH_SPECS, LANG_MIX_SPECS, EMOTIONS,
-)
-from .tags import (
-    HIGGS_V3_TAGS, RECOMMENDED_COMBINATIONS, SFX_TAGS,
-    get_all_tags, get_sfx_onomatopoeia, SFX_REQUIRES_ONO,
-)
 from .diversity import build_diversity_instructions
+from .scenarios import (
+    EMOTION_PROFILES,
+    LANG_MIX_SPECS,
+    LENGTH_SPECS,
+    SCENARIOS,
+)
+from .tag_guide import build_tag_guide
 
 
 def _build_lang_override(lang_key: str) -> str:
@@ -57,91 +56,10 @@ def _build_length_constraint(length_key: str, lang_key: str) -> str:
 
     return f"""
 ⚠️ 长度约束 ⚠️
-当前任务: {spec['name']} ({length_key})
-{spec['cn'] if is_cn else spec['en']}
-例: {spec['cn_example'] if is_cn else spec['en_example']}
-标签注入概率: 约{prob}%的句子带标签，{100-prob}%的句子为纯文本。"""
-
-
-def _build_tag_guide(emotion: str) -> str:
-    profile = EMOTION_PROFILES.get(emotion, EMOTION_PROFILES["contentment"])
-    primary = ", ".join(f"<|{t}|>" for t in profile["primary_tags"])
-    secondary = ", ".join(f"<|{t}|>" for t in profile["secondary_tags"]) if profile["secondary_tags"] else "无"
-    density_min, density_max = TAG_DENSITY_MAP.get(profile["tag_density"], (0, 2))
-
-    rec_combo = RECOMMENDED_COMBINATIONS.get(emotion, [])
-    rec_combo_str = ", ".join(f"<|{c}|>" for c in rec_combo) if rec_combo else "无特定推荐"
-
-    emotion_list = []
-    for name, info in HIGGS_V3_TAGS["emotion"].items():
-        emotion_list.append(f"  <|emotion:{name}|> — {info['cn']}")
-    emotion_table = "\n".join(emotion_list[:25])
-
-    style_list = []
-    for name, info in HIGGS_V3_TAGS["style"].items():
-        style_list.append(f"  <|style:{name}|> — {info['cn']}: {info['rule']}")
-    style_table = "\n".join(style_list)
-
-    sfx_list = []
-    for name, info in SFX_TAGS.items():
-        ono = "、".join(info["onomatopoeia_cn"][:3])
-        sfx_list.append(f"  <|sfx:{name}|> — {info['cn']} (拟声词: {ono})")
-    sfx_table = "\n".join(sfx_list)
-
-    prosody_list = []
-    for name, info in HIGGS_V3_TAGS["prosody"].items():
-        prosody_list.append(f"  <|prosody:{name}|> — {info['cn']} (放{info['placement']})")
-    prosody_table = "\n".join(prosody_list)
-
-    return f"""
-=== Higgs Audio v3 标签使用指南（极其重要，必须严格遵守） ===
-
-Higgs Audio v3 TTS 支持4类内联控制标签来控制语音交付方式。
-
-**核心规则1: 情感/风格/韵律(非pause)标签放在 input 开头，统领整句**
-✅ "<|emotion:enthusiasm|>太棒了！我们成功了！"
-✅ "<|emotion:sadness|><|sfx:sigh|>唉，又输了..."
-✅ "<|style:whispering|><|emotion:affection|>我喜欢你"
-
-**核心规则2: prosody:pause 和 long_pause 插入句中需要停顿的位置**
-✅ "我想了很久<|prosody:pause|>最后还是决定离开"
-✅ "有一件事我要告诉你<|prosody:long_pause|>我要走了"
-
-**核心规则3: SFX标签后面必须紧跟拟声词（强制要求！）**
-✅ "<|sfx:laughter|>哈哈，太好笑了"
-✅ "<|sfx:cough|>咳咳，不好意思"
-✅ "<|sfx:sneeze|>阿嚏！谁在想我？"
-✅ "<|sfx:sigh|>唉，又要加班了"
-❌ "<|sfx:laughter|>今天天气真好"  (缺少拟声词！这是错误的)
-
-**核心规则4: 多种标签可以组合，情绪标签放前面**
-✅ "<|emotion:fear|><|sfx:screaming|>啊！有老鼠！"
-✅ "<|emotion:enthusiasm|><|prosody:expressive_high|>这太不可思议了！"
-
-**核心规则5: 每条文本建议0-3个标签，不要过多。约70-80%句子不需要任何标签。**
-
-当前情绪: {emotion}
-主标签: {primary}
-次标签: {secondary}
-每条文本标签数: {density_min}-{density_max} 个
-推荐搭配: {rec_combo_str}
-位置倾向: {profile['position_bias']}
-
-**标签列表:**
-
-情感标签 (放置规则: 句首):
-{emotion_table}
-
-风格标签 (放置规则: 句首):
-{style_table}
-
-音效标签 (放置规则: 紧跟拟声词):
-{sfx_table}
-
-韵律标签:
-{prosody_table}
-
-注意: 音效标签 `sfx` 后面必须紧跟对应的拟声词文本，否则模型无法正确生成音效。"""
+当前任务: {spec["name"]} ({length_key})
+{spec["cn"] if is_cn else spec["en"]}
+例: {spec["cn_example"] if is_cn else spec["en_example"]}
+标签注入概率: 约{prob}%的句子带标签，{100 - prob}%的句子为纯文本。"""
 
 
 def _build_naturalness_rules(lang_key: str) -> str:
@@ -175,8 +93,9 @@ def _build_naturalness_rules(lang_key: str) -> str:
     return cn_rules
 
 
-def _build_output_format(batch_size: int, scenario_key: str, subscene: str,
-                         emotion: str, length_key: str, lang_key: str) -> str:
+def _build_output_format(
+    batch_size: int, scenario_key: str, subscene: str, emotion: str, length_key: str, lang_key: str
+) -> str:
     examples = [
         '{"text": "<|emotion:enthusiasm|>太棒了！我们终于成功了！这个项目真的不容易。", "length_type": "short", "lang_type": "pure_cn", "scenario": "daily_chat", "subscene": "分享趣事", "emotion": "enthusiasm", "language": "zh"}',
         '{"text": "其实我觉得<|prosody:pause|>这个方案还有一个问题需要解决", "length_type": "short", "lang_type": "pure_cn", "scenario": "business", "subscene": "项目讨论协作", "emotion": "contemplation", "language": "zh"}',
@@ -200,7 +119,7 @@ def _build_output_format(batch_size: int, scenario_key: str, subscene: str,
 
 好例子 (大部分无标签，少数带标签):
 [
-  {','.join(examples[:4])}
+  {",".join(examples[:4])}
 ]
 
 生成恰好 {batch_size} 条。不要在 JSON 前后加任何文字。"""
@@ -224,16 +143,16 @@ def build_prompt(
 
     lang_override = _build_lang_override(lang_key)
     length_strict = _build_length_constraint(length_key, lang_key)
-    tag_guide = _build_tag_guide(emotion)
+    is_cn = lang_key in ("pure_cn", "cn_main")
+    tag_guide = build_tag_guide(emotion, is_cn=is_cn)
     naturalness = _build_naturalness_rules(lang_key)
-    output_fmt = _build_output_format(batch_size, scenario_key, subscene,
-                                      emotion, length_key, lang_key)
+    output_fmt = _build_output_format(batch_size, scenario_key, subscene, emotion, length_key, lang_key)
 
     stress_instruction = ""
     if is_stress:
         stress_instruction = f"""
 === 压力测试特殊要求 ===
-当前为压力测试场景: {scenario['name']}
+当前为压力测试场景: {scenario["name"]}
 请生成满足极端条件的文本。确保文本自然但测试性强。
 """
 
@@ -242,9 +161,7 @@ def build_prompt(
     )
 
     typical_tags = ", ".join(f"<|{t}|>" for t in scenario.get("typical_tags", [])[:8])
-    typical_emotion_names = ", ".join(
-        f"{e}({w:.1f})" for e, w in scenario.get("typical_emotions", {}).items()
-    )
+    typical_emotion_names = ", ".join(f"{e}({w:.1f})" for e, w in scenario.get("typical_emotions", {}).items())
 
     prompt = f"""你是专业的TTS语音合成文本数据生成专家。请生成 {batch_size} 条自然口语文本，用于 Higgs Audio v3 TTS 模型的语音合成训练。{lang_override}
 
@@ -253,10 +170,10 @@ def build_prompt(
 Higgs Audio v3 是一款先进的文本到语音模型，支持内联标签来控制情感、风格、音效和韵律表现。
 
 === 生成任务说明 ===
-场景: {scenario['name']} — {subscene}
-场景描述: {scenario.get('description', '')}
-情绪: {emotion} (标签密度: {emotion_profile['tag_density']}，位置倾向: {emotion_profile['position_bias']})
-长度: {length_spec['cn'] if lang_key in ('pure_cn','cn_main') else length_spec['en']}
+场景: {scenario["name"]} — {subscene}
+场景描述: {scenario.get("description", "")}
+情绪: {emotion} (标签密度: {emotion_profile["tag_density"]}，位置倾向: {emotion_profile["position_bias"]})
+长度: {length_spec["cn"] if lang_key in ("pure_cn", "cn_main") else length_spec["en"]}
 语言: {lang_spec}
 {stress_instruction}
 {diversity_instruction}
