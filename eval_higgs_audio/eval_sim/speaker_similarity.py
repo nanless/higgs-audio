@@ -12,8 +12,7 @@ import torch
 from speaker_encoder import SpeakerEncoder
 
 EVAL_DIR = Path(__file__).resolve().parent
-# Higgs: model weights live in OmniVoice's eval_sim/model/
-DEFAULT_MODEL_DIR = Path("/root/code/github_repos/OmniVoice-fork/batch_generate_text_and_clone/eval_sim/model")
+DEFAULT_MODEL_DIR = EVAL_DIR / "model"
 
 
 def load_encoder(model_dir: str | None = None, device: str = "cuda:0") -> SpeakerEncoder:

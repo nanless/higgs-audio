@@ -19,8 +19,7 @@ import yaml
 from models.samresnet import SimAMResNet100ASP
 
 EVAL_DIR = Path(__file__).resolve().parent
-# Higgs: model weights live in OmniVoice's eval_sim/model/
-DEFAULT_MODEL_DIR = Path("/root/code/github_repos/OmniVoice-fork/batch_generate_text_and_clone/eval_sim/model")
+DEFAULT_MODEL_DIR = EVAL_DIR / "model"
 
 
 def load_checkpoint(model: torch.nn.Module, path: Union[str, Path]) -> None:

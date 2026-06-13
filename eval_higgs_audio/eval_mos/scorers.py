@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Unified scorer module for Higgs Audio TTS evaluation metrics.
 
-Adapted from OmniVoice batch_generate_text_and_clone/eval_mos/scorers.py.
-
 Supported metrics:
-  - UTMOS22Strong  (custom PyTorch model, loads from OmniVoice repo)
+  - UTMOS22Strong  (custom PyTorch model, utmos_model.py + audio_utils.py)
   - SCOREQ         (pip package `scoreq`, ONNX-based NR quality)
   - TTSDS2         (pip package `ttsds`, benchmark suite)
   - UTMOSv2        (git package `utmosv2`, SSL+spectrogram MOS predictor)
@@ -30,9 +28,7 @@ from typing import Dict, List, Optional, Type, Union
 import numpy as np
 import torch
 
-# Path to OmniVoice-fork repo (for UTMOS22Strong model definition)
-OMNIVOICE_REPO = Path("/root/code/github_repos/OmniVoice-fork")
-OMNIVOICE_EVAL = OMNIVOICE_REPO / "omnivoice" / "eval"
+SCORER_DIR = Path(__file__).resolve().parent
 
 AVAILABLE_METRICS: List[str] = ["UTMOS22Strong", "SCOREQ", "TTSDS2", "UTMOSv2"]
 
@@ -54,7 +50,7 @@ class BaseScorer(ABC):
 
 
 # ---------------------------------------------------------------------------
-# UTMOS22Strong — from OmniVoice omnivoice/eval/models/utmos.py
+# UTMOS22Strong — local utmos_model.py + audio_utils.py
 # ---------------------------------------------------------------------------
 
 _utmos_mod = None
@@ -74,44 +70,52 @@ def _load_module(name: str, path: Path):
 def _get_utmos_module():
     global _utmos_mod
     if _utmos_mod is None:
-        _utmos_mod = _load_module("omnivoice_eval_utmos", OMNIVOICE_EVAL / "models" / "utmos.py")
+        _utmos_mod = _load_module("higgs_utmos_model", SCORER_DIR / "utmos_model.py")
     return _utmos_mod
 
 
 def _get_utils_module():
     global _utils_mod
     if _utils_mod is None:
-        _utils_mod = _load_module("omnivoice_eval_utils", OMNIVOICE_EVAL / "utils.py")
+        _utils_mod = _load_module("higgs_audio_utils", SCORER_DIR / "audio_utils.py")
     return _utils_mod
 
 
 class UTMOS22StrongScorer(BaseScorer):
     name = "UTMOS22Strong"
 
+    # Default model checkpoint search paths
+    _DEFAULT_CKPT_PATHS = [
+        Path("/root/code/github_repos/OmniVoice-fork/TTS_eval_models/mos/utmos22_strong_step7459_v1.pt"),
+        Path.home() / ".cache/higgs_eval/utmos22_strong_step7459_v1.pt",
+    ]
+
     def __init__(self, model_dir: Union[str, Path, None] = None, device: str = "cuda:0"):
         self.device = torch.device(device)
         utmos_mod = _get_utmos_module()
         utils_mod = _get_utils_module()
 
-        model_dir = Path(
-            model_dir
-            or os.environ.get("TTS_EVAL_MODEL_DIR")
-            or os.environ.get("UTMOS_MODEL_DIR")
-            or OMNIVOICE_REPO / "TTS_eval_models"
-        )
-        ckpt_name = "mos/utmos22_strong_step7459_v1.pt"
-        ckpt = model_dir / ckpt_name
-        if not ckpt.exists():
-            alt = OMNIVOICE_REPO / "download" / "tts_eval_models" / ckpt_name
-            if alt.exists():
-                ckpt = alt
-            else:
-                raise FileNotFoundError(
-                    f"UTMOS checkpoint not found at {ckpt}.\n"
-                    "Download: huggingface-cli download --local-dir TTS_eval_models "
-                    "k2-fsa/TTS_eval_models mos/utmos22_strong_step7459_v1.pt"
-                )
-        self.model_dir = str(ckpt.parent.parent)
+        # Resolve checkpoint path
+        ckpt = None
+        if model_dir:
+            ckpt = Path(model_dir) / "mos/utmos22_strong_step7459_v1.pt"
+            if not ckpt.exists():
+                ckpt = Path(model_dir) / "utmos22_strong_step7459_v1.pt"
+
+        if ckpt is None or not ckpt.exists():
+            for p in self._DEFAULT_CKPT_PATHS:
+                if p.exists():
+                    ckpt = p
+                    break
+
+        if ckpt is None or not ckpt.exists():
+            raise FileNotFoundError(
+                "UTMOS checkpoint not found.\n"
+                "Download: huggingface-cli download --local-dir ~/.cache/higgs_eval "
+                "k2-fsa/TTS_eval_models mos/utmos22_strong_step7459_v1.pt\n"
+                "  or set TTS_EVAL_MODEL_DIR env var"
+            )
+
         self.model = utmos_mod.UTMOS22Strong()
         state_dict = torch.load(ckpt, map_location="cpu", weights_only=False)
         self.model.load_state_dict(state_dict)

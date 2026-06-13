@@ -53,8 +53,8 @@ from eval_common import (  # noqa: E402
 )
 
 # Default model dir (voxblink2_samresnet100_ft weights)
-# Points to OmniVoice's eval_sim/model/ which has config.yaml and avg_model.pt
-OMNIVOICE_SIM_MODEL = Path("/root/code/github_repos/OmniVoice-fork/batch_generate_text_and_clone/eval_sim/model")
+# Use local eval_sim/model/ (setup via setup_models.sh)
+LOCAL_SIM_MODEL = Path(__file__).resolve().parent / "model"
 
 DEFAULT_OUT_DIR = Path(
     os.environ.get(
@@ -175,7 +175,7 @@ def _sim_worker(rank: int, gpu: str, shard: list, out_dir: str, model_dir: Path,
 def _run_single_process(pairs, args, summary_path, details_path):
     gpu_list = parse_gpu_list(args.gpus, args.gpu)
     shard = [(str(c), str(r), str(j)) for c, r, j in pairs]
-    model_dir = args.model_dir or OMNIVOICE_SIM_MODEL
+    model_dir = args.model_dir or LOCAL_SIM_MODEL
     _sim_worker(0, gpu_list[0], shard, str(args.out_dir), model_dir, str(details_path), args.no_sidecar)
     results = _load_results_from_jsonl(details_path)
     summary = summarize(results)
@@ -201,7 +201,7 @@ def main():
         "--model-dir",
         type=Path,
         default=None,
-        help=f"Model dir containing config.yaml + avg_model.pt (default: {OMNIVOICE_SIM_MODEL})",
+        help=f"Model dir containing config.yaml + avg_model.pt (default: {LOCAL_SIM_MODEL})",
     )
     parser.add_argument("--gpu", type=int, default=None, help="Single GPU id")
     parser.add_argument("--gpus", type=str, default=None, help="Comma GPU ids, e.g. 0 or 0,1")
@@ -232,7 +232,7 @@ def main():
         pairs = random.Random(args.seed).sample(pairs, args.sample_size)
         print(f"Using sample of {len(pairs)} pairs (seed={args.seed})", flush=True)
 
-    model_dir = args.model_dir or OMNIVOICE_SIM_MODEL
+    model_dir = args.model_dir or LOCAL_SIM_MODEL
     tag = f"_n{args.sample_size}" if args.sample_size else ""
     summary_path = args.out_dir / f"eval_higgs_sim_summary{tag}.json"
     details_path = args.out_dir / f"eval_higgs_sim_details{tag}.jsonl"
