@@ -196,6 +196,7 @@ torch_compile_debug/
 
 # Out Dir
 result/
+clone_workdir/
 
 # Ruff
 .ruff_cache/
