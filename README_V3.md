@@ -417,6 +417,8 @@ sgl-omni serve \
   --port 8000
 ```
 
+如需在本仓库内批量复刻低时长说话人（speaker 统计 → ASR → 8 卡 SGLang-Omni TTS clone），见 [`v3_tts_clone/README.md`](v3_tts_clone/README.md)。当前生产配置使用 `tmux` session `higgs_step3`，8 个服务端口 `8000-8007`，客户端 `--workers-per-server 16`。
+
 ### 基础生成
 
 **cURL：**

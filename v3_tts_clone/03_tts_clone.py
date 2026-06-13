@@ -19,8 +19,8 @@ Usage:
         --texts-jsonl higgs_audio_v3_text_generator/batch_output_v2/generated_texts_final.jsonl \
         --output-root /root/group-shared/.../audio_higgs_audio_v3_tts_clone \
         --base-port 8000 \
-        --num-servers 2 \
-        --workers-per-server 8
+        --num-servers 8 \
+        --workers-per-server 16
 """
 
 import argparse
@@ -409,7 +409,7 @@ def main():
     parser.add_argument("--base-port", type=int, default=8000)
     parser.add_argument("--num-servers", type=int, default=2)
     parser.add_argument("--quality-pass-rate", type=float, default=0.5)
-    parser.add_argument("--workers-per-server", type=int, default=8)
+    parser.add_argument("--workers-per-server", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-speakers", type=int, default=None)
     parser.add_argument("--max-clones-per-speaker", type=int, default=None)

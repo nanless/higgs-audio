@@ -152,6 +152,58 @@ bash run_1m_gen.sh
 - 支持 `generate`、`batch`、`create-voice` 子命令
 - 需要 `BOSON_API_KEY` 环境变量
 
+## v3 TTS 声音复刻流水线（`v3_tts_clone/`）
+
+用于把总时长不足 1 小时且音频不少于 20 条的说话人，通过 Higgs Audio v3 TTS 批量复刻到 1 小时水平。
+
+### 当前生产配置
+
+- 详细文档：`v3_tts_clone/README.md`
+- 输出工作目录：`clone_workdir/`（已加入 `.gitignore`，不要提交）
+- 正式输出目录：`/root/group-shared/voiceprint/data/speech/speaker_diarization/merged_datasets_20250610_vad_segments_mtfaa_enhanced_extend_kid_withclone_addlibrilight_1130/audio_higgs_audio_v3_tts_clone`
+- 后台任务使用 `tmux` session `higgs_step3`
+- 8 个 SGLang-Omni 服务：GPU `0-7` → 端口 `8000-8007`
+- 客户端并发：`--workers-per-server 16`（总并发约 128）
+- 请求模式：非流式 `/v1/audio/speech`；每条完整返回后写入 `clone_XXXX.wav`
+- 文本选择：不按 dataset 或 speaker 语言过滤；所有 speaker 从完整文本池随机抽样，覆盖中文、英文、中英混合
+- 进度日志：`clone_workdir/step3_progress_tmux.log`
+- 客户端日志：`clone_workdir/step3_tmux_client.log`
+- 服务端日志：`clone_workdir/step3_tmux_servers.log`
+
+### SGLang-Omni 本地安装
+
+- 源码固定在 `/root/code/github_repos/sglang-omni`
+- `higgs_v3_env` 使用 editable 安装：
+
+```bash
+/root/code/github_repos/higgs-audio/higgs_v3_env/bin/python3 \
+    -m pip install -e /root/code/github_repos/sglang-omni --no-deps
+```
+
+- 不要让 pip 重新解析依赖，避免升级 torch/transformers 等大包。
+
+### 常用命令
+
+```bash
+# 查看后台任务
+tmux attach -t higgs_step3
+
+# 查看进度
+tail -f clone_workdir/step3_progress_tmux.log
+
+# 启动 8 卡服务
+bash v3_tts_clone/03_launch_servers.sh "0,1,2,3,4,5,6,7" /root/models/higgs-audio-v3-tts-4b 8000
+
+# 全量客户端（当前生产参数）
+python v3_tts_clone/03_tts_clone.py \
+    --stats-csv ./clone_workdir/speaker_duration_stats.csv \
+    --texts-jsonl higgs_audio_v3_text_generator/batch_output_v2/generated_texts_final.jsonl \
+    --output-root /root/group-shared/voiceprint/data/speech/speaker_diarization/merged_datasets_20250610_vad_segments_mtfaa_enhanced_extend_kid_withclone_addlibrilight_1130/audio_higgs_audio_v3_tts_clone \
+    --base-port 8000 \
+    --num-servers 8 \
+    --workers-per-server 16
+```
+
 ## 核心架构
 
 ```
