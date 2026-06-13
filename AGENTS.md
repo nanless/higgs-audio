@@ -7,16 +7,20 @@
 - Docker 镜像（推荐）：`nvcr.io/nvidia/pytorch:25.02-py3` 或 `25.01-py3`
 - 包名为 `boson_multimodal`（非 `higgs_audio`），定义在 `setup.cfg`
 - GPU 推理需要至少 24GB 显存
+- `higgs_v3_env/`（repo 根目录）：conda 虚拟环境，专用于 v3 TTS 声音复刻流水线的 SGLang-Omni 服务端（已加入 `.gitignore`，不提交）
 
 ## 构建与质量检查
 
-- **Lint/Format**：`ruff format --check .`（CI 只检查这一项，无 unit test、无 typecheck）
+- **Lint/Format**：`ruff format --check .`（唯一 CI 步骤）
+- CI 工作流：`.github/workflows/test.yml`，在 push/PR 到 `main` 分支时执行，使用 sysmtem python 安装 `ruff==0.12.2` 后检查格式
 - ruff 版本锁定 `0.12.2`，配置在 `pyproject.toml`（行宽 119、双引号、py310 目标）
 - ruff 额外规则：import 排序（`I`）、pyupgrade（`UP`）、banned API（`os.getenv`/`os.putenv`/`os.unsetenv` 禁止，必须用 `os.environ`）、copyright 检查（`CPY`）
 - **禁止** `os.getenv`、`os.putenv`、`os.unsetenv`（banned API），必须用 `os.environ` 访问
 - `__init__.py` 中 F401（unused import）被忽略（用于 re-export）
 - **无 mypy/typecheck 配置，无 pytest 目录，无任何 `test_*.py` 文件**
-- **无 GitHub Actions workflows**（`.github/workflows/` 目录不存在）
+- `pyproject.toml` 中 `extend-select` 额外启用了 `B009`（static getattr）、`B010`（static setattr）
+- `pyproject.toml` 中 ignore 了 `E501`（行宽由 ruff-format 处理）、`E741`（歧义变量名）、`W605`（非法转义序列）、`UP007`（X | Y 类型注解）
+- `pyproject.toml` 中 isort 配置：`lines-after-imports = 2`、`known-first-party = ["character_tuning"]`
 
 ## 仓库定位
 
@@ -24,6 +28,10 @@
 - 核心模块在 `boson_multimodal/` 下，安装后即为顶级 Python 包
 - `setup.cfg` 排除 `tests*` 和 `training*` 目录
 - `boson_multimodal/__init__.py` 是**空文件**
+- 根目录 `README.md` 现在是 v3 入口页面，v2/v2.5 文档已移至 `README_V2.md`，v3 详细文档在 `README_V3.md`
+- 贡献和支持指南：`SUPPORT_GUIDELINES.md`
+- 技术博客：`tech_blogs/ARCHITECTURE_BLOG.md`（DualFFN 架构）、`tech_blogs/TOKENIZER_BLOG.md`（25fps audio tokenizer）
+- **重要 `.gitignore` 模式**：`clone_workdir/`（v3 声音复刻工作目录）、`*.wav`（生成的音频）、`*.jsonl`（数据集文件）、`higgs_audio_v3_text_generator/batch_output/`、`child_voice_clone_output_higgs`——这些不被跟踪，不要提交
 
 ## v3 文本生成子项目（`higgs_audio_v3_text_generator/`）
 
@@ -156,9 +164,33 @@ bash run_1m_gen.sh
 
 用于把总时长不足 1 小时且音频不少于 20 条的说话人，通过 Higgs Audio v3 TTS 批量复刻到 1 小时水平。
 
+### 核心文件
+
+```
+v3_tts_clone/
+├── README.md                  # 174 行详细文档
+├── 01_stats_speakers.py       # Step 1: 统计说话人时长 → speaker_duration_stats.csv
+├── 02_asr_launch.sh           # Step 2: 启动多 GPU ASR 服务
+├── 02_asr_worker.py           # Step 2: ASR 转写 worker（Qwen3-ASR 1.7B）
+├── 03_launch_servers.sh       # Step 3: 启动多 GPU SGLang-Omni TTS 服务
+└── 03_tts_clone.py            # Step 3: TTS 克隆客户端
+```
+
+### 环境隔离
+
+| Step | 环境 | 说明 |
+|------|------|------|
+| Step 1 | 系统 Python | 仅需 librosa、soundfile |
+| Step 2 | `qwen3-asr` conda env | Qwen3-ASR 1.7B + transformers 4.57.6 |
+| Step 3 服务端 | `higgs_v3_env` conda env | SGLang-Omni editable 安装，每 GPU 一个进程 |
+| Step 3 客户端 | 系统 Python | 仅需 requests、soundfile、numpy |
+
+### 排除的数据集
+
+`childmandarin`, `child207m-korean-filtered`, `chineseenglishchildren`, `king-asr-725`, `kingasr612`, `speechocean762`
+
 ### 当前生产配置
 
-- 详细文档：`v3_tts_clone/README.md`
 - 输出工作目录：`clone_workdir/`（已加入 `.gitignore`，不要提交）
 - 正式输出目录：`/root/group-shared/voiceprint/data/speech/speaker_diarization/merged_datasets_20250610_vad_segments_mtfaa_enhanced_extend_kid_withclone_addlibrilight_1130/audio_higgs_audio_v3_tts_clone`
 - 后台任务使用 `tmux` session `higgs_step3`
@@ -173,7 +205,7 @@ bash run_1m_gen.sh
 ### SGLang-Omni 本地安装
 
 - 源码固定在 `/root/code/github_repos/sglang-omni`
-- `higgs_v3_env` 使用 editable 安装：
+- `higgs_v3_env` 使用 editable 安装，**必须加 `--no-deps`**：
 
 ```bash
 /root/code/github_repos/higgs-audio/higgs_v3_env/bin/python3 \
@@ -202,6 +234,30 @@ python v3_tts_clone/03_tts_clone.py \
     --base-port 8000 \
     --num-servers 8 \
     --workers-per-server 16
+```
+
+## 童声批量复刻流水线（v2，独立工具）
+
+基于 v2 模型（`HiggsAudioServeEngine`）的童声批量复刻，与 `SoulX-Podcast` 对比。
+
+### 核心文件
+
+- `batch_child_voice_clone_higgs.py`：批处理脚本，从 BAAI-ChildMandarin 数据集随机采样 100 个样本进行语音克隆
+- `run_child_voice_clone_higgs.sh`：启动脚本
+- `CHILD_VOICE_CLONE_README.md`：148 行详细文档
+- `COMPARISON_WITH_SOULX.md`：与 SoulX-Podcast 的对比分析（模型架构、API 差异、输出采样率等）
+- 输出目录：`child_voice_clone_output_higgs/`（已加入 `.gitignore`）
+
+```bash
+# 一键启动
+./run_child_voice_clone_higgs.sh
+
+# 或直接调用 Python
+python3 batch_child_voice_clone_higgs.py \
+    --model-path "bosonai/higgs-audio-v2-generation-3B-base" \
+    --audio-tokenizer-path "bosonai/higgs-audio-v2-tokenizer" \
+    --output-dir "./child_voice_clone_output_higgs" \
+    --num-samples 100 --random-seed 42 --seed 1988
 ```
 
 ## 核心架构
@@ -262,12 +318,12 @@ serve_engine = HiggsAudioServeEngine(
 )
 ```
 
-- 构造函数自动下载模型、tokenizer、audio tokenizer；创建多个 bucket 的 `StaticCache`；若 device=cuda 则自动 `capture_model()`
+- 构造函数自动下载模型、tokenizer、audio tokenizer（从 HuggingFace Hub）；创建多个 bucket 的 `StaticCache`；若 device=cuda 则自动 `capture_model()`
 - `serve_engine.generate(chat_ml_sample=..., max_new_tokens=..., temperature=..., top_p=..., ...)` → 同步返回 `HiggsAudioResponse`
 - `serve_engine.generate_delta_stream(...)` → 异步返回 `AsyncGenerator[HiggsAudioStreamerDelta]`
 - `HiggsAudioResponse` 含 `audio`（np.ndarray）、`sampling_rate`、`generated_text`、`generated_audio_tokens`、`usage`
 - CLI 示例：`python3 examples/generation.py --transcript ... --ref_audio belinda --out_path out.wav`
-- 快速上手：`quick_start.py`（单文件最小示例）
+- 快速上手：`quick_start.py`（单文件最小示例，38 行）
 - vLLM 部署：`examples/vllm/` 提供 OpenAI 兼容 API（`/v1/audio/speech`、`/v1/chat/completions`）
 
 ### HiggsAudioModel（HuggingFace 模型）
@@ -280,7 +336,7 @@ serve_engine = HiggsAudioServeEngine(
 
 `HiggsAudioModel.generate()` **完全覆盖**了 `GenerationMixin.generate()`，核心在自定义的 `_sample()` 方法中：
 
-### 三种生成模式（GenerationMode enum）
+### 三种生成模式（GenerationMode enum，定义于 modeling_higgs_audio.py:45）
 
 ```
 TEXT              → 生成普通文本 token
@@ -288,7 +344,7 @@ AUDIO_INIT        → 遇到 <|audio_out_bos|>，开始声频生成模式
 AUDIO_IN_PROGRESS → 正在生成声频 token
 ```
 
-### 生成循环（`_sample()` 方法，约 1675-1930 行）
+### 生成循环（`_sample()` 方法，约 1624-1960 行）
 
 1. 检查 `input_ids[0][-1]` 判断当前 mode
 2. 文本模式下：从 `outputs.logits` 采样文本 token，若遇到 `audio_out_bos_token_id` 则输出 `<|AUDIO_OUT|>` + `audio_stream_bos_id` tokens 触发声频生成
@@ -297,6 +353,7 @@ AUDIO_IN_PROGRESS → 正在生成声频 token
 5. `audio_out_ids` 逐步累积声频 token 序列
 6. **仅支持 batch_size=1**（代码中有 assert）
 7. **不使用 HF 的 LogitsWarper、StoppingCriteria 等标准组件**，而是在 `_sample_audio_tokens()` / `_sample_text_tokens()` 中手动处理
+8. 文本 token 采样自定义 temperature、top_k、top_p，与 HF 标准行为**不完全一致**
 
 ### 声频生成的 delay pattern 处理
 
@@ -341,7 +398,7 @@ AUDIO_IN_PROGRESS → 正在生成声频 token
 - `tokenizer.sampling_rate`：采样率（如 16000）
 - `tokenizer.tps`（tokens per second）：`frame_rate`（如 50 Hz）
 - `tokenizer.num_codebooks`：codebook 数量（如 12）
-- `tokenizer.codebook_size`：返回 `quantizer_dim`（注意不是实际 codebook size）
+- `tokenizer.codebook_size`：返回 `quantizer_dim`（**注意不是实际 codebook size，实际 size 需 +2**）
 
 ### encode/decode 签名
 ```python
@@ -354,9 +411,10 @@ wv = tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 - encode 返回的 code 不含 stream_bos/stream_eos
 - decode 前必须先 `revert_delay_pattern()`（如果使用了 delay pattern）
 
-### MPS 陷阱
-- **MPS (Apple Silicon) 上必须将 audio tokenizer 放在 CPU**：量化层的 embedding 操作在 MPS 上受限
-- 参考：`examples/generation.py:672` 和 `serve_engine.py:223`
+### MPS（Apple Silicon）陷阱
+- **MPS 上必须将 audio tokenizer 放在 CPU**：量化层的 embedding 操作在 MPS 上受限
+- MPS 不支持 StaticCache / CUDA graph，需要禁用
+- 相关处理见 `examples/generation.py:672-677`
 
 ## delay pattern
 
@@ -369,7 +427,7 @@ wv = tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 ## KV Cache
 
 - 使用 `StaticCache`（`transformers.cache_utils`），需手动创建及 `reset()`
-- 多 bucket 大小（默认 `[1024, 4096, 8192]`），运行时自动将小 cache 复制到大 cache（`_copy_kv_cache()`）
+- 多 bucket 大小（默认 `[1024, 4096, 8192]`），运行时自动将小 cache 复制到大 cache（`_copy_kv_cache()`，在 `_update_model_kwargs_for_generation()` 中实现）
 - CUDA 设备上执行 `model.capture_model()` 捕获 CUDA graph：每个 kv_cache_length × 2（text decode + audio decode 各一个）
 - CUDA graph 在 `_forward_core`（即 layer loop）级别捕获，不包含 `audio_decoder_proj`（head 仍走正常 forward）
 - MPS 不支持 StaticCache / CUDA graph
@@ -411,23 +469,24 @@ wv = tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 - 为每个 audio-in 的 codebook 序列首尾插入 `audio_stream_bos_id` 和 `audio_stream_eos_id`
 - 若 `use_delay_pattern=True`：调用 `build_delay_pattern_mask()` 做 delay 偏移
 - 若 `return_audio_in_tokens=False`（推理时）：audio_in_ids 置为 None（只用 whisper features）
-- 推理时使用 `pad_left=False`，训练时使用 `pad_left=False`；单样本时 `left_padding=False`
+- padding 默认 `pad_left=False`（推理和训练均用左 padding），单样本时 `left_padding=False`
 
 ## Whisper 编码器
 
 - `encode_whisper_embed` 配置控制是否使用 whisper encoder 编码音频为 mel 特征
 - whisper 模型：`openai/whisper-large-v3-turbo`
-- whisper forward 被 monkey-patch 以支持 zero-shape tensor（`_whisper_encoder_zero_shape_forward`），因为原始 whisper encoder 的 `_shape` 方法在 bsz=0 时有 bug
-- **monkey-patch 在每次 `_apply_audio_tower()` 调用时动态应用和恢复**，不是一次性全局 patch
+- whisper forward 被 monkey-patch 以支持 zero-shape tensor（`_whisper_encoder_zero_shape_forward`，`modeling_higgs_audio.py:53`），因为原始 whisper encoder 的 `_shape` 方法在 bsz=0 时有 bug
+- **monkey-patch 在每次 `_apply_audio_tower()` 调用时动态应用和恢复**，不是一次性全局 patch（见 `modeling_higgs_audio.py:62` 注释及 `:947` 调用点）
 - whisper encoder 不支持 flash_attention_2，强制使用 sdpa
 
 ## 依赖版本约束
 
-- `transformers>=4.45.1,<4.47.0`（**注意上限 <4.47**）
+- `transformers>=4.45.1,<4.47.0`（**注意上限 <4.47**，不能升级）
 - `ruff==0.12.2`（精确锁定）
+- `boto3==1.35.36`（精确锁定）
 - `torch`、`torchaudio`、`torchvision` 无版本约束，随 Docker 镜像提供
 - 音频处理依赖 `vector_quantize_pytorch`、`descript-audio-codec`、`librosa`
-- 其他：`dacite`、`boto3`、`loguru`、`pydub`、`omegaconf`、`click`、`langid`、`jieba`、`accelerate>=0.26.0`
+- 其他：`dacite`、`s3fs`、`json_repair`、`pandas`、`pydantic`、`loguru`、`pydub`、`omegaconf`、`click`、`langid`、`jieba`、`accelerate>=0.26.0`
 
 ## 训练相关模块
 
@@ -457,11 +516,12 @@ wv = tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 
 - `os.getenv` / `os.putenv` / `os.unsetenv` → 改用 `os.environ`
 - `__init__.py` 中 unused import → F401 豁免（用于 re-export）
+- 所有源文件需要包含 Copyright 头（ruff CPY 规则检查），不要删除或修改已有版权声明
 
 ## 常见操作速查
 
 ```bash
-# Lint 检查（唯一 CI 步骤）
+# Lint 检查（唯一 CI 步骤 / 提交前必跑）
 ruff format --check .
 
 # 自动修复
