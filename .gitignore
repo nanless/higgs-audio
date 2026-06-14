@@ -211,3 +211,4 @@ higgs_v3_env/
 # Higgs Audio v3 text generator outputs and env
 higgs_audio_v3_text_generator/batch_output/
 higgs_audio_v3_text_generator/.env
+cer_bad_samples_top100_20260614_191916

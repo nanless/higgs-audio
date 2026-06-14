@@ -19,7 +19,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
 
-SIDECAR_SUFFIXES = (".eval.json", ".mos.json", ".sim.json")
+SIDECAR_SUFFIXES = (".eval.json", ".cer.json", ".mos.json", ".sim.json")
 SKIP_DIRS = {"logs", "__pycache__", "eval_sim_embedding_cache"}
 
 

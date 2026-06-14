@@ -189,6 +189,71 @@ v3_tts_clone/
 
 `childmandarin`, `child207m-korean-filtered`, `chineseenglishchildren`, `king-asr-725`, `kingasr612`, `speechocean762`
 
+### Step 1 说话人统计细节（`01_stats_speakers.py`）
+
+- 排除 `CHILD_DATASETS` 集合中的 6 个童声数据集
+- 支持音频格式：`.wav`, `.flac`, `.mp3`
+- WAV 文件用快速路径计算时长：读取 44 字节头取 `sr/bps/ch`，然后 `file_size / bytes_per_sec`（不读完整文件）
+- 非 WAV 文件用 `soundfile.info()` 获取时长
+- 输出 CSV 字段：`dataset`, `speaker_id`, `num_files`, `total_duration_sec`, `avg_duration_sec`, `max_duration_sec`, `min_duration_sec`, `has_7to20s`（是否有 7-20s 片段）, `speaker_path`
+- ProcessPoolExecutor 并行处理，**每个 dataset 处理完后增量保存 CSV**，避免丢失进度
+- `has_7to20s` 字段：标记该 speaker 是否有单条时长在 7-20s 范围内的音频（用于参考音频选择）
+
+### Step 2 ASR 转写细节（`02_asr_worker.py`）
+
+- **文件级 batching**（非 speaker 级），按语言分组后批量处理以最大化 GPU 吞吐
+- 硬编码 `DATASET_LANG` 映射表（17 个 dataset → Chinese/English/Japanese），用于 ASR 语言提示
+- Worker 分配策略：`i % total_gpus == gpu_id`（CSV 行号取模）
+- **跳过已完成**：如果 `{audio_path}.json` 已存在则跳过
+- 模型：`Qwen3ASRModel.from_pretrained()`，路径 `/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local`
+- 依赖 `qwen_asr` 包（来自 `/root/code/github_repos/Qwen3-ASR`）
+- 输出：ASR 结果保存为 `{audio_path}.json`（与音频同目录），含 `transcript`, `language`, `dataset`, `speaker_id` 字段
+- 错误处理：batch 异常时仍然写 JSON（含 `error` 字段），确保不会重复处理
+
+### Step 3 TTS 克隆细节（`03_tts_clone.py`）
+
+#### 说话人筛选逻辑
+- 条件：`total_duration_sec < 3600` **且** `num_files >= 20`
+- 少于 20 条音频的说话人被丢弃（`filtered_out` 计数）
+- 所需克隆数 = `(3600 - current_dur) / estimate_clone_duration / quality_pass_rate + 1`
+  - 默认 `estimate_clone_duration=10s`, `quality_pass_rate=0.5` → 实际生成 2x buffer
+
+#### 参考音频选择（`select_ref_audio()`）
+- **优先单条**：在 speaker 目录中寻找 7-20s 的单条音频，随机选一条
+- **拼接 fallback**：如果没有 7-20s 单条，从短于 20s 的片段中尝试拼接 2-5 条，目标总时长 7-20s
+- 拼接时插入 **300ms 静音**（`np.zeros(int(0.3 * sample_rate))`）
+- 拼接采样率统一为 **16000 Hz**（`librosa.load(fp, sr=16000, mono=True)`）
+- 种子确定性：`md5(f"{dataset}__{speaker_id}") % 100000 + base`
+- 读取 ASR 转写结果：从 `{audio_path}.json` sidecar 中取 `transcript` 字段作为 `ref_text`
+
+#### SGLang TTS API 调用
+- 端点：`POST http://localhost:{port}/v1/audio/speech`
+- Payload：`{"input": text, "references": [{"audio_path": ref_path, "text": ref_text}], "temperature": 0.8, "top_k": 50, "max_new_tokens": 1024}`
+- 重试策略：最多 3 次，5xx 指数退避，timeout 300s
+- **非流式**：完整返回音频 bytes 后写入文件
+
+#### 断点续跑
+- 检查 `clone_XXXX.wav` 是否存在且 `> 1000 bytes` 且 `clone_XXXX.json` 存在 → 跳过
+- 同一输出目录可断点续跑，无需额外检查点文件
+
+#### 并发架构
+- Speaker 按 round-robin 分配到 N 个 server
+- 每个 server 用 `ThreadPoolExecutor(max_workers=workers_per_server)` 并发处理
+- 外层用 `ThreadPoolExecutor(max_workers=len(servers))` 并行所有 server 的任务
+
+#### 输出格式
+```
+{output_root}/{dataset}/{speaker_id}/
+├── ref_audio.wav              # 参考音频（单条复制或拼接生成）
+├── ref_audio.json             # 参考音频元数据（uid, source_files, duration, transcript 等）
+├── clone_0000.wav             # 克隆音频
+├── clone_0000.json            # 克隆元数据（clone_idx, text, clean_text, emotion, scenario, tags_used 等）
+├── clone_0001.wav
+├── clone_0001.json
+└── ...
+```
+- 运行结束后在 `output_root/` 下生成 `clone_summary.json`（总计 speakers/clones/failed/elapsed）
+
 ### 当前生产配置
 
 - 输出工作目录：`clone_workdir/`（已加入 `.gitignore`，不要提交）
@@ -213,6 +278,9 @@ v3_tts_clone/
 ```
 
 - 不要让 pip 重新解析依赖，避免升级 torch/transformers 等大包。
+- `03_launch_servers.sh` 启动前会验证 `sglang_omni` 是否可 import，以及 `sgl-omni` 可执行文件是否存在
+- 每个 server 独占一块 GPU：`CUDA_VISIBLE_DEVICES=$GPU sgl-omni serve --model-path $MODEL --port $PORT --host 0.0.0.0`
+- 启动后 30s 健康检查：`GET http://localhost:$PORT/health`，返回 200 表示就绪
 
 ### 常用命令
 
@@ -234,7 +302,286 @@ python v3_tts_clone/03_tts_clone.py \
     --base-port 8000 \
     --num-servers 8 \
     --workers-per-server 16
+
+# 测试模式（限制范围）
+python v3_tts_clone/03_tts_clone.py \
+    --stats-csv ./clone_workdir/speaker_duration_stats.csv \
+    --texts-jsonl ... --output-root ... \
+    --max-speakers 5 --max-clones-per-speaker 1
 ```
+
+## 评估流水线（`eval_higgs_audio/`）
+
+从 OmniVoice `batch_generate_text_and_clone/` 的 eval 代码适配而来，评估 Higgs Audio v3 TTS 克隆音频质量。三个维度：**CER**（字错率）、**SIM**（说话人相似度）、**MOS**（音质评分）。
+
+### 目录结构
+
+```
+eval_higgs_audio/
+├── __init__.py                         # 空文件
+├── eval_common.py                      # 共享工具（扫描、分片、累加器、I/O）
+├── run_eval_all.sh                     # 一键评估总控（CER → SIM → MOS）
+├── setup_models.sh                     # 模型权重下载/符号链接
+├── eval_cer/                           # 字错率评估
+│   ├── eval_cer.py                     # CER 评估主脚本（ASR + Manual ITN）
+│   ├── .env                            # LLM ITN 配置（可选，当前未启用）
+│   └── run_eval_cer.sh                 # 启动脚本（自动激活 qwen3-asr conda env）
+├── eval_sim/                           # 说话人相似度评估
+│   ├── eval_sim.py                     # SIM 评估主脚本（多进程）
+│   ├── speaker_encoder.py              # SpeakerEncoder 类（fbank + SamResNet100ASP）
+│   ├── speaker_similarity.py           # 相似度计算工具（封装 encoder）
+│   ├── models/samresnet.py             # SimAM_ResNet100 + ASP 模型定义（vendored，无 wespeaker 依赖）
+│   ├── model/avg_model.pt              # 模型权重（symlink，由 setup_models.sh 创建）
+│   ├── model/config.yaml               # 模型配置
+│   └── run_eval_sim.sh                 # 启动脚本（自动激活 omnivoice conda env）
+└── eval_mos/                           # 音质评估
+    ├── eval_mos.py                     # MOS 评估主脚本（多指标，多进程）
+    ├── scorers.py                      # 4 种评分器（UTMOS22Strong/SCOREQ/TTSDS2/UTMOSv2）
+    ├── utmos_model.py                  # UTMOS22Strong 模型定义（Wav2Vec2 架构）
+    ├── audio_utils.py                  # 音频加载工具（resample + mono 转换）
+    └── run_eval_mos.sh                 # 启动脚本（自动激活 omnivoice conda env）
+```
+
+### 与 OmniVoice 源版本的关键差异
+
+| 维度 | OmniVoice | Higgs Audio（本适配版） |
+|------|-----------|------------------------|
+| **音频格式** | 16 kHz mono WAV | **24 kHz** mono WAV（评估时内部 resample 到 16 kHz） |
+| **文件命名** | `text_NNN.wav` / `text_NNN.json` | `clone_NNNN.wav` / `clone_NNNN.json` |
+| **目录结构** | `{dataset}/{speaker}/{utt_id}/text_NNN.wav` | `{dataset}/{speaker_id}/clone_NNNN.wav` |
+| **参考文本** | `gen_text` 字段 | `clean_text` 字段（fallback `text`） |
+| **标签格式** | `[sigh]`, `[laughter]` 方括号 | `<\|emotion:joy\|>`, `<\|prosody:speed_slow\|>` 管道格式 |
+| **ITN** | 有 LLM ITN | 仅 Manual ITN（LLM ITN 暂未启用） |
+| **参考音频** | sidecar 中的 `ref_audio` 路径 | 同目录下的 `ref_audio.wav` |
+
+### 共享工具（`eval_common.py`）
+
+- **扫描逻辑**：`iter_clone_records()` 递归查找 `clone_NNNN.json` + `.wav` 配对，多进程并行（ProcessPoolExecutor）
+- **sidecar 判定**：匹配 `clone_\d+\.json` 正则，排除 `.eval.json` / `.mos.json` / `.sim.json` 后缀
+- **跳过目录**：`logs`, `__pycache__`, `eval_sim_embedding_cache`
+- `list_clone_items()`：返回 `(wav_path, json_path)` 列表（CER/MOS 使用）
+- `list_clone_pairs()`：返回 `(clone_wav, ref_audio.wav, json_path)` 三元组（SIM 使用），自动在 speaker 目录中查找 `ref_audio.wav`
+- `CerAccumulator`：加权 CER 累加器（按字符数加权）
+- `split_shards()`：round-robin 分片，用于多进程分工
+
+### 环境依赖
+
+| 评估步骤 | Conda 环境 | 额外依赖 |
+|----------|-----------|----------|
+| **CER** | `qwen3-asr` | `qwen_asr`（来自 `/root/code/github_repos/Qwen3-ASR`）、`jiwer`、`word2number`、`soundfile`、`torchaudio`、`tqdm` |
+| **SIM** | `omnivoice` | `torch`、`torchaudio`、`yaml`、SamResNet100 权重 |
+| **MOS** | `omnivoice` | `scoreq`（pip）、`ttsds`（pip）、`utmosv2`（git）、UTMOS22Strong 权重 |
+
+### CER 评估详解（`eval_cer/eval_cer.py`）
+
+#### 流程
+1. 扫描 clone 目录 → 找到所有 `clone_NNNN.wav` + `clone_NNNN.json` 配对
+2. Qwen3-ASR 转写 wav（batch_size=16，24 kHz → 16 kHz 内部重采样）
+3. Manual ITN（对 ref 和 hypo 同时执行）
+4. `jiwer.process_characters()` 计算字符级 CER
+5. 结果写入 sidecar + JSONL
+
+#### Manual ITN 流程（`manual_itn()`）
+- **去除 Higgs 标签**：正则 `<\|[^|>]+\|[^>]*>` 匹配并删除
+- **数字归一化**：
+  - 百分数：`百分之三十` → `30`
+  - 分数：`三分之一` → `3分之1`
+  - 中文金额：`三块五` → `3块5`
+  - 单位：`kilometers per hour` → `kmh`
+  - 英文数词：`twenty-three` → `23`（依赖 `word2number` 库）
+  - 中文数词：`三百六十五` → `365`
+  - 中文数字串：`一二三` → `123`
+- **去除标点**：保留数字间的小数点（如 `3.14`）
+- **全小写** + **空格规范化**
+
+#### ASR 模型
+- 模型路径：`/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local`
+- 依赖 `qwen_asr` 包：通过 `sys.path.insert(0, "/root/code/github_repos/Qwen3-ASR")` 加载
+- 转写语言固定为 `language="Chinese"`（适用于中英混合）
+- ASR 结果缓存：`eval_higgs_asr_cache.json`（避免重复推理）
+
+#### 输出
+- Sidecar：`clone_NNNN.eval.json`（含 `wav_path`, `gen_text`, `asr_hypo`, `ref_manual`, `hypo_manual`, `manual_cer`, `substitutions`, `insertions`, `deletions`, `chars`）
+- 汇总：`eval_higgs_cer_summary.json`（含 overall + per-dataset 分解：`weighted_cer`, `avg_cer`, `median_cer`, `p10_cer`, `p90_cer`）
+- 明细：`eval_higgs_cer_details.jsonl`
+
+#### 命令
+
+```bash
+# 需要 conda qwen3-asr 环境
+conda activate qwen3-asr
+
+# 评估所有 clone
+python eval_cer.py --out-dir /path/to/clone_output
+
+# 随机采样 500 条
+python eval_cer.py --out-dir /path/to/clone_output --sample-size 500 --seed 42
+
+# 使用缓存 ASR 结果（跳过推理）
+python eval_cer.py --out-dir /path/to/clone_output --skip-asr
+
+# 跳过已评估的
+python eval_cer.py --out-dir /path/to/clone_output --skip-existing
+
+# 或直接用 shell 脚本
+bash run_eval_cer.sh --out-dir /path/to/clone_output --sample-size 500
+```
+
+### SIM 评估详解（`eval_sim/eval_sim.py`）
+
+#### 流程
+1. 扫描 clone 目录 → 找到 `(clone_NNNN.wav, ref_audio.wav, clone_NNNN.json)` 三元组
+2. SamResNet100ASP 提取 256 维 speaker embedding
+3. 余弦相似度 → 映射到 `[0, 1]`：`(cos_sim + 1) / 2`
+4. 结果写入 sidecar + JSONL
+
+#### Speaker Encoder（`speaker_encoder.py`）
+- 模型：`SimAMResNet100ASP`（`models/samresnet.py`），vendored 实现（无 wespeaker 外部依赖）
+- 权重：`eval_sim/model/avg_model.pt`（voxblink2_samresnet100_ft），通过 `setup_models.sh` 创建符号链接
+- 前处理：与 wespeaker `Speaker` 类一致：`torchaudio.load(normalize=False)` → `float pcm` → `Resample(16kHz)` → `fbank * (1<<15)` → `CMN`
+- fbank 参数：`num_mel_bins=80`, `frame_length=25`, `frame_shift=10`, `window_type=hamming`
+- 支持单条 `extract_embedding()` 和批量 `extract_embeddings_batch()`（pad fbank 到 max frame）
+
+#### 多进程
+- `mp.get_context("spawn")` 创建进程
+- GPU round-robin 分配：`gpu_list[i % len(gpu_list)]`
+- 每个 worker 限制线程数：`OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1` 等
+- 多进程结果通过 JSONL part 文件汇总（`eval_higgs_sim_details.w{i}.jsonl` → merge → `eval_higgs_sim_details.jsonl`）
+
+#### 输出
+- Sidecar：`clone_NNNN.sim.json`（含 `cloned_audio`, `ref_audio`, `similarity`, `dataset`）
+- 汇总：`eval_higgs_sim_summary.json`（含 overall + per-dataset：`mean`, `min`, `max`, `p10`, `p50`, `p90`）
+
+#### 命令
+
+```bash
+# 需要 conda omnivoice 环境
+conda activate omnivoice
+
+# 评估所有 pair
+python eval_sim.py --out-dir /path/to/clone_output
+
+# 采样 200 条，4 进程
+python eval_sim.py --out-dir /path/to/clone_output --sample-size 200 --workers 4 --gpus 0,1
+
+# 跳过已评估的
+python eval_sim.py --out-dir /path/to/clone_output --skip-existing
+
+# 或直接用 shell 脚本
+bash run_eval_sim.sh --out-dir /path/to/clone_output --sample-size 200
+```
+
+### MOS 评估详解（`eval_mos/eval_mos.py` + `scorers.py`）
+
+#### 4 种 MOS 指标
+
+| 指标 | 来源 | 范围 | 类型 | 批量评分 |
+|------|------|------|------|---------|
+| **UTMOS22Strong** | 自定义 PyTorch 模型（`utmos_model.py`） | 1-5 | 参考感知质量 | 支持（动态 batch，max 8 per batch，30s 截断） |
+| **SCOREQ** | pip `scoreq` | NR | ONNX 无参考质量 | 不支持（逐条） |
+| **TTSDS2** | pip `ttsds` | 0-100 | WavLM+Whisper+pitch 综合 | 支持（ThreadPool 8 线程） |
+| **UTMOSv2** | git `utmosv2` | 1-5 | SSL+spectrogram MOS | 支持（numpy batch，max 30s，batch_size=64） |
+
+#### UTMOS22Strong 模型
+- 架构：自定义 Wav2Vec2（7 层 ConvFeatureExtractor + 12 层 Transformer）→ domain_emb + judge_emb → BLSTM → Projection → 时间平均 → `score * 2 + 3`
+- Checkpoint 搜索顺序：
+  1. `--model-dir` / `mos/utmos22_strong_step7459_v1.pt`
+  2. `/root/code/github_repos/OmniVoice-fork/TTS_eval_models/mos/utmos22_strong_step7459_v1.pt`
+  3. `~/.cache/higgs_eval/utmos22_strong_step7459_v1.pt`
+- 输入音频统一 resample 到 16 kHz
+
+#### TTSDS2 评分（`scorers.py`）
+- 主模式：加载 ttsds 包中的 WavLM / Whisper / Pitch benchmark，计算 embedding 与噪声 embedding 的距离
+- Fallback 模式：如果 benchmark 加载失败，使用 librosa 的 spectral_flatness + RMS + SNR 代理指标
+- 不依赖外部模型权重下载
+
+#### 多进程
+- 与 SIM 相同的 spawn 多进程 + GPU round-robin 模式
+- 支持 `--no-sidecar` 不写 sidecar JSON
+
+#### 输出
+- Sidecar：`clone_NNNN.mos.json`（含 `cloned_audio`, `dataset`, `utmos22strong`/`scoreq`/`ttsds2`/`utmosv2` 各指标得分）
+- 汇总：`eval_higgs_mos_summary.json`（含 overall + per-dataset + per-language 分解）
+
+#### 命令
+
+```bash
+# 需要 conda omnivoice 环境
+conda activate omnivoice
+
+# 评估所有 clone（全部指标）
+python eval_mos.py --out-dir /path/to/clone_output
+
+# 仅 UTMOS22Strong + SCOREQ，2 进程
+python eval_mos.py --out-dir /path/to/clone_output --metrics UTMOS22Strong,SCOREQ --workers 2 --gpus 0,1
+
+# 采样 200 条
+python eval_mos.py --out-dir /path/to/clone_output --sample-size 200 --skip-existing
+
+# 或直接用 shell 脚本
+bash run_eval_mos.sh --out-dir /path/to/clone_output --sample-size 200
+```
+
+### 一键全流程评估（`run_eval_all.sh`）
+
+```bash
+# CER + SIM + MOS 全流程
+bash eval_higgs_audio/run_eval_all.sh
+
+# 仅 CER
+bash eval_higgs_audio/run_eval_all.sh --skip-sim --skip-mos --sample-size 500
+
+# 仅 SIM
+bash eval_higgs_audio/run_eval_all.sh --skip-cer --skip-mos --sample-size 500
+
+# 仅 MOS
+bash eval_higgs_audio/run_eval_all.sh --skip-cer --skip-sim --sample-size 1000
+
+# 自定义 clone 目录
+HIGGS_CLONE_ROOT=/your/path bash eval_higgs_audio/run_eval_all.sh --sample-size 500
+```
+
+### 评估环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `HIGGS_CLONE_ROOT` | 生产路径 | Clone 音频输出根目录 |
+| `HIGGS_CER_GPU` | `0` | CER ASR 使用的 GPU |
+| `HIGGS_SIM_GPU` | `0` | SIM 使用的 GPU |
+| `HIGGS_SIM_WORKERS` | `1` | SIM 并行 worker 数 |
+| `HIGGS_MOS_GPUS` | `0` | MOS 使用的 GPU（逗号分隔） |
+| `HIGGS_MOS_WORKERS` | `1` | MOS 并行 worker 数 |
+| `HIGGS_ASR_BATCH_SIZE` | `16` | ASR 批大小 |
+| `HIGGS_EVAL_SAMPLE_SIZE` | 全部 | 随机采样数量 |
+
+### 模型权重准备（`setup_models.sh`）
+
+```bash
+# 一键准备所有评估模型权重
+bash eval_higgs_audio/setup_models.sh
+```
+
+- **SIM 权重**（`avg_model.pt`）：自动从已知路径创建符号链接（`/root/workspace/speaker_verification/...` 或 OmniVoice-fork）
+- **UTMOS checkpoint**（`utmos22_strong_step7459_v1.pt`）：自动从 OmniVoice-fork 创建符号链接，或提示手动下载：
+  ```bash
+  huggingface-cli download --local-dir ~/.cache/higgs_eval k2-fsa/TTS_eval_models mos/utmos22_strong_step7459_v1.pt
+  ```
+
+### 评估输出文件汇总
+
+所有汇总文件写在 clone 根目录下：
+
+| 文件 | 说明 |
+|------|------|
+| `eval_higgs_cer_summary.json` | CER 汇总（overall + per-dataset） |
+| `eval_higgs_cer_details.jsonl` | CER 逐条明细 |
+| `eval_higgs_asr_cache.json` | ASR 推理缓存（避免重复转写） |
+| `eval_higgs_sim_summary.json` | SIM 汇总（overall + per-dataset） |
+| `eval_higgs_sim_details.jsonl` | SIM 逐条明细 |
+| `eval_higgs_mos_summary.json` | MOS 汇总（overall + per-dataset + per-language） |
+| `eval_higgs_mos_details.jsonl` | MOS 逐条明细 |
+
+Sidecar 文件写在每个 clone 音频旁边：`clone_NNNN.eval.json`, `clone_NNNN.sim.json`, `clone_NNNN.mos.json`
 
 ## 童声批量复刻流水线（v2，独立工具）
 
@@ -246,10 +593,11 @@ python v3_tts_clone/03_tts_clone.py \
 - `run_child_voice_clone_higgs.sh`：启动脚本
 - `CHILD_VOICE_CLONE_README.md`：148 行详细文档
 - `COMPARISON_WITH_SOULX.md`：与 SoulX-Podcast 的对比分析（模型架构、API 差异、输出采样率等）
+- `batch_clone_v3.py`：使用 v3 SGLang-Omni API 复刻童声的简单脚本（POST `/v1/audio/speech`，遍历 `child_voice_clone_output_higgs/sample_*`）
 - 输出目录：`child_voice_clone_output_higgs/`（已加入 `.gitignore`）
 
 ```bash
-# 一键启动
+# 一键启动（v2）
 ./run_child_voice_clone_higgs.sh
 
 # 或直接调用 Python
@@ -258,6 +606,9 @@ python3 batch_child_voice_clone_higgs.py \
     --audio-tokenizer-path "bosonai/higgs-audio-v2-tokenizer" \
     --output-dir "./child_voice_clone_output_higgs" \
     --num-samples 100 --random-seed 42 --seed 1988
+
+# v3 童声复刻（需要先启动 SGLang-Omni 服务）
+python3 batch_clone_v3.py
 ```
 
 ## 核心架构
