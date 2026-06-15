@@ -137,29 +137,83 @@ tail -f clone_workdir/step3_progress_tmux.log
 audio_higgs_audio_v3_tts_clone/
 └── {dataset}/
     └── {speaker_id}/
-        ├── ref_audio.wav          # 参考音频
-        ├── ref_audio.json         # 参考音频元数据
-        ├── clone_0000.wav         # 克隆音频
-        ├── clone_0000.json        # 克隆元数据
+        ├── ref/
+        │   ├── ref_pool.json          # 候选池配置 + 全部候选元数据
+        │   └── ref_{hash}.wav         # 按需物化的参考（random 模式多条）
+        ├── clone_0000.wav             # 克隆音频
+        ├── clone_0000.json            # 含本条实际 ref_audio_path
         └── ...
 ```
 
+每条 clone 的 `clone_XXXX.json` 记录**当次使用的** `ref_audio_path`（指向 `ref/ref_{hash}.wav`），不再写统一的 `ref_audio.wav`。
+
 ## JSON 元数据
 
-### 参考音频 (`ref_audio.json`)
+### 参考候选池 (`ref/ref_pool.json`)
+
 ```json
-{"uid": "...", "ref_audio_path": "...", "ref_before_duration_sec": 12.5,
- "ref_audio_type": "single|concat", "ref_transcript": "...",
- "source_files": [...], "num_concat_clips": 1}
+{"uid": "...", "ref_mode": "random", "ref_pool_size": 256,
+ "candidates": [{"type": "concat", "duration_sec": 8.3, "source_files": [...]}]}
 ```
 
 ### 克隆音频 (`clone_NNNN.json`)
 ```json
 {"clone_idx": 0, "uid": "...", "text": "...", "clean_text": "...",
- "emotion": "...", "scenario": "...", "tags_used": [...],
- "ref_audio_source": "...", "ref_transcript": "...",
- "ref_audio_duration_sec": 12.5, "audio_format": "wav"}
+ "ref_audio_path": ".../ref/ref_{hash}.wav", "ref_audio_type": "concat",
+ "ref_transcript": "...", "ref_mode": "random", "audio_format": "wav"}
 ```
+
+## Step 4: 质量过滤后重新评估时长
+
+质量过滤（CER/SIM prune）后，用 **源音频时长 + 保留 clone 时长** 重新统计，找出仍不足 1h 的说话人：
+
+```bash
+python v3_tts_clone/04_post_prune_stats.py \
+    --stats-csv ./clone_workdir/speaker_duration_stats.csv \
+    --clone-root /root/group-shared/.../audio_higgs_audio_v3_tts_clone \
+    --output-dir ./clone_workdir \
+    --total-clone-hours 10000
+```
+
+输出：
+
+| 文件 | 说明 |
+|------|------|
+| `speaker_duration_stats_post_prune.csv` | 全部说话人（含 OK / NEED_CLONE） |
+| `speaker_duration_stats_post_prune_resume.csv` | 仅 NEED_CLONE，供 Step 3 续跑 |
+| `post_prune_stats_summary.json` / `.txt` | 汇总报告 |
+
+**分配策略**：在 NEED_CLONE 说话人之间，按各自 `gap_sec`（距 3600s 的缺口）占比，分配 `--total-clone-hours`（默认 **10000** 小时）的生成预算。每人 `clones_needed = max(1, int(allocated_sec / estimate_clone_duration) + 1)`，不再按「每人补满 1h + quality_pass_rate buffer」估算。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--total-clone-hours` | `10000` | 全局 clone 生成小时预算（按缺口比例分配） |
+| `--estimate-clone-duration` | `10` | 估算每条 clone 秒数，用于换算条数 |
+
+### Step 3 续跑（post-prune）
+
+```bash
+python v3_tts_clone/03_tts_clone.py \
+    --stats-csv ./clone_workdir/speaker_duration_stats_post_prune_resume.csv \
+    --post-prune \
+    --texts-jsonl higgs_audio_v3_text_generator/batch_output_v2/generated_texts_final.jsonl \
+    --output-root /root/group-shared/.../audio_higgs_audio_v3_tts_clone \
+    --base-port 8000 --num-servers 8 --workers-per-server 16
+```
+
+续跑会从已有 `clone_XXXX` 最大编号 +1 开始生成，不会覆盖已保留的 clone。
+
+### 参考/文本随机性（`03_tts_clone.py`）
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--ref-mode` | `random` | `fixed` 每人固定一条 ref；`rotate` 每 N 条换 ref；`random` 每条 clone 独立 ref |
+| `--ref-rotate-every` | `50` | `rotate` 模式下每 N 条 clone 换一次参考 |
+| `--ref-pool-size` | `256` | 每说话人从合法单条/拼接组合中最多采样 256 个候选 ref |
+| `--seed` | `42` | 全局 seed（ref 与文本选取可复现、可断点续跑） |
+
+- **拼接参考**：在合法 7–20s 组合中随机/穷举采样，不再只取第一个命中组合  
+- **文本**：每条 clone 独立随机抽取（`pick_text(uid, clone_idx, seed)`），不再一次 shuffle 顺序取  
 
 ## 参数速查
 
@@ -168,7 +222,7 @@ audio_higgs_audio_v3_tts_clone/
 | `--base-port` | 8000 | 8000 | SGLang 起始端口 |
 | `--num-servers` | 2 | 8 | SGLang 实例数（=GPU数）|
 | `--workers-per-server` | 16 | 16 | 每服务器并发线程数 |
-| `--quality-pass-rate` | 0.5 | 0.5 | 质量通过率（决定 2x buffer）|
+| `--total-clone-hours` | 10000 | 10000 | Step 4 全局 clone 预算（按缺口比例分配） |
 | `--estimate-clone-duration` | 10 | 10 | 平均每条克隆音频秒数 |
 | `--max-speakers` | None | None | 限制人数（测试用）|
 | `--max-clones-per-speaker` | None | None | 限制每个说话人生成条数（测试用）|

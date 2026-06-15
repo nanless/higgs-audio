@@ -24,6 +24,10 @@ echo "Model: $MODEL"
 echo "Ports: $((BASE_PORT + GPU_ARR[0])) - $((BASE_PORT + GPU_ARR[TOTAL - 1]))"
 echo ""
 
+echo "Cleaning stale sgl-omni processes..."
+pkill -f "sgl-omni serve" 2>/dev/null || true
+sleep 3
+
 # Verify model exists
 if [ ! -f "$MODEL/model.safetensors" ]; then
     echo "ERROR: model.safetensors not found at $MODEL"

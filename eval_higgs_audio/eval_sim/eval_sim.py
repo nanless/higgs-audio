@@ -8,7 +8,7 @@ Multi-process: splits pairs across --workers processes.
 Adapted from OmniVoice batch_generate_text_and_clone/eval_sim/eval_clone_similarity.py.
 
 Key differences from OmniVoice:
-- Higgs reference audio: ref_audio.wav in same speaker directory
+- Higgs reference audio: per-clone ref_audio_path in clone sidecar JSON
 - Higgs metadata: clean_text field (OmniVoice: gen_text)
 - Output: clone_NNNN.sim.json (OmniVoice: text_NNN.sim.json)
 
@@ -71,16 +71,21 @@ _SKIP_DIRS = frozenset({"logs", "__pycache__", "eval_sim_embedding_cache"})
 
 
 def _fast_scan_speaker(speaker_dir: str) -> List[Tuple[str, str, str]]:
-    ref = os.path.join(speaker_dir, "ref_audio.wav")
-    if not os.path.isfile(ref):
-        return []
     results: list = []
     for entry in os.scandir(speaker_dir):
         if not entry.is_file() or not _CLONE_WAV_RE.match(entry.name):
             continue
         json_path = entry.path[:-4] + ".json"
-        if os.path.isfile(json_path):
-            results.append((entry.path, ref, json_path))
+        if not os.path.isfile(json_path):
+            continue
+        try:
+            with open(json_path, encoding="utf-8") as jf:
+                ref = json.load(jf).get("ref_audio_path", "")
+            if not ref or not os.path.isfile(ref):
+                continue
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        results.append((entry.path, ref, json_path))
     return results
 
 

@@ -212,3 +212,8 @@ higgs_v3_env/
 higgs_audio_v3_text_generator/batch_output/
 higgs_audio_v3_text_generator/.env
 cer_bad_samples_top100_20260614_191916
+
+eval_higgs_audio/eval_distribution_report.json
+eval_higgs_audio/eval_distribution_report.txt
+
+eval_higgs_audio/logs

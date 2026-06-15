@@ -167,16 +167,24 @@ def list_clone_items(out_dir: Path, label: str = "scan", scan_workers: int = 8) 
 
 
 def list_clone_pairs(out_dir: Path, label: str = "scan", scan_workers: int = 8) -> List[Tuple[Path, Path, Path]]:
-    """Yield (cloned_wav, ref_audio, sidecar_json) for similarity evaluation.
-
-    Higgs: ref_audio.wav lives in the speaker directory alongside clone_NNNN.* files.
-    """
+    """Yield (cloned_wav, ref_audio, sidecar_json) for similarity evaluation."""
     t0 = time.time()
     pairs = []
-    for cloned, json_path, meta in iter_clone_records(out_dir, workers=scan_workers):
-        # ref_audio.wav is in the same directory as the clone files (speaker dir)
-        ref = cloned.parent / "ref_audio.wav"
-        if ref.is_file():
+    for cloned, json_path, _meta in iter_clone_records(out_dir, workers=scan_workers):
+        ref = _resolve_ref_audio(cloned, json_path)
+        if ref is not None:
             pairs.append((cloned, ref, json_path))
     print(f"[{label}] {len(pairs)} sim pairs in {time.time() - t0:.1f}s", flush=True)
     return pairs
+
+
+def _resolve_ref_audio(cloned: Path, json_path: Path) -> Path | None:
+    """Per-clone reference from clone sidecar ref_audio_path."""
+    try:
+        meta = json.loads(json_path.read_text(encoding="utf-8"))
+        ref_path = Path(meta.get("ref_audio_path", ""))
+        if ref_path.is_file():
+            return ref_path
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return None
