@@ -40,7 +40,8 @@
 ### 定位与依赖
 
 - **与 `boson_multimodal/` 完全独立**，不 import 主项目代码
-- 自己独立的 `requirements.txt`（仅 3 个依赖：`requests`, `tqdm`, `loguru`），无需 torch/transformers
+- 自己独立的 `requirements.txt`（列了 `requests`, `tqdm`, `loguru`），无需 torch/transformers
+- **注意**：`tqdm` 和 `loguru` 虽然在 `requirements.txt` 中，但实际源码中**从未被 import**。`requests` 仅在 `tts_client.py` 中使用
 - LLM 推理通过外部 vLLM 服务调用（OpenAI 兼容 API，`/v1/chat/completions`），不在本进程中加载模型
 - 默认使用 Qwen3.6-27B 作为文本生成模型
 - 硬件需求：约 80GB GPU per vLLM instance（H100/A100 推荐）
@@ -159,6 +160,79 @@ bash run_1m_gen.sh
 - 将生成的文本发送到 Boson Higgs Audio v3 TTS API 进行语音合成
 - 支持 `generate`、`batch`、`create-voice` 子命令
 - 需要 `BOSON_API_KEY` 环境变量
+- API 端点：`https://api.boson.ai/v1/audio/speech`、`https://api.boson.ai/v1/voices`
+- `batch_generate` 固定输出 wav 格式，忽略 `response_format` 参数
+
+### 环境变量（文本生成子项目）
+
+| 变量 | 读取位置 | 默认值 | 说明 |
+|------|---------|--------|------|
+| `LLM_MODEL` | `config.py`, `llm_client.py` | `qwen3.6-27b` | vLLM 模型名 |
+| `LLM_BASE_URL` | `config.py`, `llm_client.py` | `http://localhost:8000` | vLLM API 地址 |
+| `LLM_API_KEY` | `llm_client.py` | `EMPTY` | API Key（也检查 `VLLM_API_KEY`、`OPENAI_API_KEY`） |
+| `BOSON_API_KEY` | `tts_client.py` | — | Boson TTS API Key |
+
+### 代码级注意事项与陷阱
+
+#### llm_client.py（核心 HTTP 客户端）
+- **仅用 `urllib`**，不依赖 `requests` 库（零第三方依赖）
+- HTTP 超时 **180 秒**
+- JSON 提取 `_extract_json()` 会先去除 Qwen3 的 `<think>...</think>` 思考块（找最后一个 `</think>` 并取其后内容）
+- 去除 markdown 代码围栏后提取 `[...]` JSON 数组
+- 兜底正则提取单个 `{"text":"..."}` 对象——**比较脆弱**
+- 重试指数退避：`wait = retry_base_delay * (2 ** attempt)`
+- 总失败时返回空列表（不抛异常）
+
+#### llm_local.py（本地 HF 推理，未被生产使用）
+- `_extract_json` 与 `llm_client.py` 中的**代码重复**
+- 使用 `tokenizer.apply_chat_template(enable_thinking=False)` 禁用 Qwen3 思考模式
+- 固定 `top_p=0.95`
+
+#### compact_prompt.py vs prompt_builder.py
+- **生产代码使用 `compact_prompt.py`**（通过 `worker.py` 导入 `build_compact_prompt`）
+- `prompt_builder.py` + `diversity.py` 是**旧版本**，仍从 `__init__.py` 导出但不再被调用
+- `compact_prompt.py` 有自己内联的 10 轴多样性池，与 `diversity.py` 的池**完全独立**
+
+#### run_batch_generation.py 代码重复
+- 内部有自己的 `worker_fn`——与 `worker.py` 几乎相同但添加了抑制提示注入
+- 重复了 `tags.py`、`text_clean.py` 中的正则模式
+- 重复了 `dedup.py` 中的 `_normalize_for_dedup` 逻辑
+
+#### run_parallel_batch.py 硬编码限制
+- 端口列表**硬编码为 4 个**：`[8000, 8001, 8002, 8003]`
+- `--num-instances` 参数超过 4 时**不会生效**
+- 合并阶段无去重，仅简单拼接 JSONL
+
+#### postprocess_merge.py 硬编码限制
+- `for w in range(4)` 硬编码读取 4 个 worker 输出文件
+
+#### quality_filter.py 陷阱
+- `_validate_emotion_position()` 是**死代码**——始终返回 True，从不拒绝任何文本
+- `_validate_length_match()` 使用 `bounds[1] * 1.5` 上界容差——即 "short" 类型最多可到 75 字符（50 × 1.5）
+- `reject_severe_length_mismatch` 配置字段**已声明但从未被检查**——长度不匹配只产生警告不拒绝
+- `_is_complete_utterance()` 会将以 `"..."` 或 `"…"` 结尾的文本判为不完整——可能误拒意图留白的文本
+- `BAD_MARKERS` 含 13 个敏感词：股票/投资/政治/战争/sex/kill/die/porn/no cap/fuck/shit/damn/cunt
+
+#### tag_guide.py 遗留代码
+- `_PROHIBITED_SAME_CATEGORY = frozenset({"prosody"})` 已声明但**从未被使用**——被显式的 `_PROHIBITED_PAIRS`（14 对互斥约束）取代
+
+#### tags.py 常量
+- `LENGTH_BOUNDS`（字符数范围）：`ultra_short=(3,20)`, `short=(10,50)`, `medium=(30,120)`, `long=(80,300)`, `very_long=(150,600)`
+- `_LABEL_DENSITIES`（标签密度分布）：`[(0, 0.30), (1, 0.40), (2, 0.25), (3, 0.05)]`——30% 无标签、40% 1标签、25% 2标签、5% 3标签
+- `SFX_REQUIRES_ONO` 包含 8 个（不含 `sniff`），检查窗口为标签后 **10 个字符**
+
+#### dedup.py 算法细节
+- 精确去重：对原始文本和归一化文本分别做 MD5 哈希（双重哈希）
+- 增量去重 `filter_incremental_duplicates()`：
+  - 按 `scenario+subscene+emotion+length+lang` 分组（context key）
+  - 长度差 > 55% 跳过比较
+  - 3-gram shingle 重叠率 < 12% 跳过
+  - 最终用 `SequenceMatcher.ratio()` 检查 `same_context_dup_threshold`（默认 0.52）
+- 语义去重 `semantic_deduplicate()`：分组内 Jaccard 3-gram 字符级相似度（非词级）
+
+#### 所有入口脚本的 sys.path 注入
+- `generate_single.py`、`run_batch_generation.py`、`postprocess_merge.py` 均使用 `sys.path.insert(0, ...)` + 绝对导入 `from higgs_text_gen.xxx`
+- **从其他目录运行会失败**——必须在 `higgs_audio_v3_text_generator/` 目录下执行，或确保 `sys.path` 正确
 
 ## v3 TTS 声音复刻流水线（`v3_tts_clone/`）
 
@@ -310,6 +384,37 @@ python v3_tts_clone/03_tts_clone.py \
     --max-speakers 5 --max-clones-per-speaker 1
 ```
 
+### 代码级注意事项与陷阱
+
+#### 01_stats_speakers.py
+- WAV 快速路径仅读取**每个 speaker 目录的第一个 WAV** 的 44 字节头，假设同目录所有 WAV 格式相同
+- 44 字节是最小规范 WAV 头；扩展头或 `fmt` chunk > 16 字节会导致 offset 22/24/34 取到错误字段
+- 时长计算 `file_size / bytes_per_sec` **包含 44 字节头的大小**——对 >1s 文件影响可忽略
+- `_list_audio()`：如果 speaker 目录有**任何子目录**，会丢弃平面扫描结果改为递归遍历（空子目录也会触发）
+- `_save_progress()` 每个 dataset 完成后**重写整个 CSV**（非增量追加），内部 `all_stats.sort()` 会原地修改调用方的列表
+- `_pct()` 是自定义百分位实现（线性插值，非 numpy），假设输入已排序
+
+#### 02_asr_worker.py Bug
+- **`json.dump(dict, ensure_ascii=False)` 行 164 附近**：`ensure_ascii=False` 被作为第二个位置参数传入（即 `fp=False`），实际会抛出 `AttributeError: 'bool' object has no attribute 'write'`，被外层 `except Exception: pass` 静默吞掉。**错误 JSON 文件永远不会被写入**
+- 实际效果：失败的文件不会被标记为已完成，下次运行会重新处理（变成隐式重试机制）
+- 硬编码 `DATASET_LANG` 映射表（17 个 dataset → Chinese/English/Japanese），不在映射中的 dataset 使用 `language=None`（自动检测）
+- Worker 分片策略 `i % total_gpus == gpu_id` 使用 CSV 行号取模——**GPU ID 必须是 0..N-1 连续整数**，非连续 GPU（如 `"2,5,7"`）会导致分片永远不匹配
+
+#### 03_launch_servers.sh 端口计算
+- 端口公式：`PORT = BASE_PORT + GPU_ID`（如 GPU 3 → 端口 8003）
+- **与 `03_tts_clone.py` 不兼容**：客户端使用 `base_port + i`（i 为 0..N-1 序号）——非连续 GPU 时端口号不一致
+- 启动后 30s 健康检查，未就绪再等 30s（最长 60s）
+
+#### 03_tts_clone.py 注意事项
+- `--seed 42` 参数**被解析但从未使用**——所有实际 seed 来自 `make_seed(uid, 0)`（`md5(uid) % 100000`），与全局 seed 无关
+- `pick_texts()` 对整个文本池做 `list(texts)` 拷贝 + `random.shuffle()`——百万级文本池 × 128 并发线程可能造成显著内存压力
+- `shutil.copy2` 失败（参考音频复制）被 `except OSError: pass` 静默忽略——后续 TTS API 调用会引用不存在的文件导致全部失败
+- `select_ref_audio()` 的 `best` fallback 可能返回**超出 [7, 20]s 范围**的组合（取最接近中心 13.5s 的组合）
+- 文本池耗尽时使用硬编码 fallback：`{"text": "Hello, this is a test.", "clean_text": "Hello, this is a test."}` ——仅英文
+- 拼接音频的参考音频路径 `dst_ref` 指向输出目录中的副本——SGLang 服务必须能访问此文件系统路径
+- TTS API 响应 < 100 bytes 视为失败、clone WAV < 1000 bytes 视为无效
+- 健康检查失败会 `sys.exit(1)` 终止进程
+
 ## 评估流水线（`eval_higgs_audio/`）
 
 从 OmniVoice `batch_generate_text_and_clone/` 的 eval 代码适配而来，评估 Higgs Audio v3 TTS 克隆音频质量。三个维度：**CER**（字错率）、**SIM**（说话人相似度）、**MOS**（音质评分）。
@@ -325,7 +430,8 @@ eval_higgs_audio/
 ├── eval_cer/                           # 字错率评估
 │   ├── eval_cer.py                     # CER 评估主脚本（ASR + Manual ITN）
 │   ├── .env                            # LLM ITN 配置（可选，当前未启用）
-│   └── run_eval_cer.sh                 # 启动脚本（自动激活 qwen3-asr conda env）
+│   ├── run_eval_cer.sh                 # 启动脚本（自动激活 qwen3-asr conda env）
+│   └── start_vllm_multi.sh            # vLLM 多 GPU 启动脚本（LLM ITN 用）
 ├── eval_sim/                           # 说话人相似度评估
 │   ├── eval_sim.py                     # SIM 评估主脚本（多进程）
 │   ├── speaker_encoder.py              # SpeakerEncoder 类（fbank + SamResNet100ASP）
@@ -397,11 +503,12 @@ eval_higgs_audio/
 #### ASR 模型
 - 模型路径：`/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local`
 - 依赖 `qwen_asr` 包：通过 `sys.path.insert(0, "/root/code/github_repos/Qwen3-ASR")` 加载
-- 转写语言固定为 `language="Chinese"`（适用于中英混合）
+- 转写语言**自动检测**：`infer_asr_language()` 根据 CJK/Latin 字符比例判断——`latin > cjk*2` → English，`cjk > latin*2` → Chinese，否则 "Unknown"（传 `None` 让 Qwen3 自动检测）
 - ASR 结果缓存：`eval_higgs_asr_cache.json`（避免重复推理）
+- 支持多 GPU ASR：按 round-robin 分配 batch 到多块 GPU，每块 GPU 在独立线程中运行
 
 #### 输出
-- Sidecar：`clone_NNNN.eval.json`（含 `wav_path`, `gen_text`, `asr_hypo`, `ref_manual`, `hypo_manual`, `manual_cer`, `substitutions`, `insertions`, `deletions`, `chars`）
+- Sidecar：`clone_NNNN.cer.json`（含 `wav_path`, `gen_text`, `asr_hypo`, `ref_manual`, `hypo_manual`, `manual_cer`, `substitutions`, `insertions`, `deletions`, `chars`）
 - 汇总：`eval_higgs_cer_summary.json`（含 overall + per-dataset 分解：`weighted_cer`, `avg_cer`, `median_cer`, `p10_cer`, `p90_cer`）
 - 明细：`eval_higgs_cer_details.jsonl`
 
@@ -581,7 +688,49 @@ bash eval_higgs_audio/setup_models.sh
 | `eval_higgs_mos_summary.json` | MOS 汇总（overall + per-dataset + per-language） |
 | `eval_higgs_mos_details.jsonl` | MOS 逐条明细 |
 
-Sidecar 文件写在每个 clone 音频旁边：`clone_NNNN.eval.json`, `clone_NNNN.sim.json`, `clone_NNNN.mos.json`
+Sidecar 文件写在每个 clone 音频旁边：`clone_NNNN.cer.json`, `clone_NNNN.sim.json`, `clone_NNNN.mos.json`
+
+### 代码级注意事项与陷阱
+
+#### eval_common.py 通用工具
+- `write_json()` 使用**原子写入**：先写 `.tmp` 文件再 `os.rename()`，避免进程崩溃时产生半写文件
+- `iter_clone_records()` 支持一级（`{dataset}/clone_*.json`）和二级（`{dataset}/{speaker}/clone_*.json`）目录结构
+- `_is_clone_sidecar()` 双重过滤：先匹配 `clone_\d+\.json`，再排除 `.eval.json`/`.cer.json`/`.mos.json`/`.sim.json` 后缀
+- **跳过目录**：`logs`、`__pycache__`、`eval_sim_embedding_cache`
+- `CerAccumulator` 使用**字符数加权** CER 而非简单平均
+
+#### eval_cer.py（CER 评估，1498 行）
+- **LLM ITN 默认关闭**——需要 `--enable-llm` 才会启用 LLM 反向文本规范化
+- `load_env_file()` 在**模块导入时**即执行——`.env` 值通过 `os.environ.setdefault` 注入，不会覆盖已存在的环境变量
+- `get_truth_text()` 使用 `@lru_cache(maxsize=200_000)`——大规模评估时可能消耗显著内存
+- **Pickle 扫描缓存**：`eval_higgs_scan_cache.pkl` 写入 clone 根目录，多进程/多次评估可能冲突
+- **分片支持**：`--num-shards N --shard-index I` 用于分布式评估（`i % N == I` 确定性分片）
+- Manual ITN 的 `_parse_chinese_number()` 支持大写数字（壹佰→100），`_CN_NUM` 含 21 个映射
+- Manual ITN 有 34 个英文缩写展开模式（`_CONTRACTION_REPLACEMENTS`）、12 个 SFX 规范化模式（`_SFX_REPLACEMENTS`）
+- `_extract_json_array` 会去除 Qwen3 的 `<|thinker|>...</|thinker|>` 和 `<|assistant|>` 标记
+- LLM ITN 生产者-消费者模式：ASR 线程生产 → 有界队列 → `--llm-concurrency`（默认 24）个消费者线程并发处理
+- LLM ITN 后处理：对比 LLM CER 与 manual CER，仅在 LLM 结果**更优**时才采用
+
+#### eval_sim.py 和 speaker_encoder.py
+- SIM 余弦相似度映射：`(cos_sim + 1) / 2` → 输出范围 `[0, 1]`（不是标准余弦相似度）
+- **fbank 缩放关键**：`torchaudio.load(normalize=False)` 返回 int16 值，再 `× (1<<15)` 匹配 wespeaker 约定——**这对正确的 speaker embedding 至关重要**
+- `yaml.FullLoader` 加载模型配置（`config.yaml`）——若配置文件不可信存在安全风险
+- 多进程使用 `mp.get_context("spawn")`（非 fork），每个 worker 设 `torch.set_num_threads(1)`
+
+#### eval_mos.py 和 scorers.py
+- UTMOS22Strong 分数公式：`raw_score * 2 + 3`，映射到 [1, 5] MOS 范围
+- UTMOS22Strong 批量推理：最大 8 条/batch，30s 截断（`MAX_AUDIO_LEN = 30 * 16000`）
+- `utmos_model.py` 中 `MultiheadAttention.forward` **硬编码 `training=False`**——训练模式下行为不正确
+- SCOREQ 尝试加载 `CUDAExecutionProvider` 的 ONNX session，失败时**静默回退到 CPU**
+- TTSDS2 benchmark 初始化**深度脆弱**——动态加载 ttsds 内部 5 个模块，任一失败则静默退回 librosa 启发式指标（spectral_flatness + RMS + SNR），分数含义完全不同
+- UTMOSv2 批量推理：`batch_size=64`，`num_workers=4`，30s 截断
+- `scorers.py` 使用 `importlib.util.spec_from_file_location` 动态加载 `utmos_model.py` 和 `audio_utils.py`——避免导入顺序问题
+- UTMOS22Strong checkpoint 搜索顺序：`--model-dir/mos/...` → OmniVoice-fork 路径 → `~/.cache/higgs_eval/...`
+
+#### start_vllm_multi.sh（LLM ITN 用）
+- 默认使用 GPU `2,3,4,5,6,7`（6 卡），端口 `BASE_PORT + GPU_ID`
+- 每个实例：`vllm serve --language-model-only --enable-prefix-caching --gpu-memory-utilization 0.95 --max-model-len 8192 --max-num-seqs 16`
+- 启动后等待 **300 秒** 再健康检查
 
 ## 童声批量复刻流水线（v2，独立工具）
 

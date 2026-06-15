@@ -27,9 +27,12 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import re
 import random
 import sys
+import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
@@ -45,7 +48,6 @@ sys.path.insert(0, str(EVAL_DIR))
 import speaker_similarity as sim  # noqa: E402
 from eval_common import (  # noqa: E402
     append_jsonl,
-    list_clone_pairs,
     merge_jsonl_parts,
     parse_gpu_list,
     split_shards,
@@ -64,12 +66,62 @@ DEFAULT_OUT_DIR = Path(
 )
 
 
-def find_clone_pairs(out_dir: Path) -> List[Tuple[Path, Path, Path]]:
-    """Find (cloned_wav, ref_audio, sidecar_json) triples.
+_CLONE_WAV_RE = re.compile(r"^clone_\d+\.wav$")
+_SKIP_DIRS = frozenset({"logs", "__pycache__", "eval_sim_embedding_cache"})
 
-    Higgs: ref_audio.wav is in the same speaker directory as clone_NNNN.wav.
+
+def _fast_scan_speaker(speaker_dir: str) -> List[Tuple[str, str, str]]:
+    ref = os.path.join(speaker_dir, "ref_audio.wav")
+    if not os.path.isfile(ref):
+        return []
+    results: list = []
+    for entry in os.scandir(speaker_dir):
+        if not entry.is_file() or not _CLONE_WAV_RE.match(entry.name):
+            continue
+        json_path = entry.path[:-4] + ".json"
+        if os.path.isfile(json_path):
+            results.append((entry.path, ref, json_path))
+    return results
+
+
+def find_clone_pairs(out_dir: Path, scan_workers: int = 16) -> List[Tuple[Path, Path, Path]]:
+    """Fast scan for (cloned_wav, ref_audio, sidecar_json) triples.
+
+    Only stats files/dirs — does NOT read JSON content during scan.
     """
-    return list_clone_pairs(out_dir, label="sim-scan", scan_workers=8)
+    out_dir = Path(out_dir)
+    t0 = time.time()
+
+    speaker_dirs: list[str] = []
+    for ds_entry in os.scandir(str(out_dir)):
+        if not ds_entry.is_dir() or ds_entry.name in _SKIP_DIRS:
+            continue
+        has_sub = False
+        for spk_entry in os.scandir(ds_entry.path):
+            if spk_entry.is_dir() and spk_entry.name not in _SKIP_DIRS:
+                speaker_dirs.append(spk_entry.path)
+                has_sub = True
+        if not has_sub:
+            speaker_dirs.append(ds_entry.path)
+
+    raw: list[tuple] = []
+    if len(speaker_dirs) > 1 and scan_workers > 1:
+        with ProcessPoolExecutor(max_workers=scan_workers) as executor:
+            futs = {executor.submit(_fast_scan_speaker, sd): sd for sd in speaker_dirs}
+            done = 0
+            for fut in as_completed(futs):
+                batch = fut.result()
+                raw.extend(batch)
+                done += 1
+                if done % 2000 == 0:
+                    print(f"[sim-scan] scanned {done}/{len(speaker_dirs)} speakers, {len(raw)} pairs ...", flush=True)
+    else:
+        for sd in speaker_dirs:
+            raw.extend(_fast_scan_speaker(sd))
+
+    pairs = [(Path(c), Path(r), Path(j)) for c, r, j in raw]
+    print(f"[sim-scan] {len(pairs)} pairs from {len(speaker_dirs)} speakers in {time.time() - t0:.1f}s", flush=True)
+    return pairs
 
 
 def write_sim_json(json_path: Path, record: dict):
@@ -137,6 +189,11 @@ def _sim_worker(rank: int, gpu: str, shard: list, out_dir: str, model_dir: Path,
     encoder = sim.load_encoder(str(model_dir), device="cuda:0")
     print(f"[sim-w{rank}] gpu={gpu} items={len(shard)}", flush=True)
 
+    shard.sort(key=lambda x: x[1])
+
+    ref_emb_cache: dict[str, object] = {}
+    _SENTINEL = object()
+
     for cloned_s, ref_s, json_s in tqdm(shard, desc=f"sim-w{rank}", position=rank):
         cloned_wav = Path(cloned_s)
         ref_audio = Path(ref_s)
@@ -148,7 +205,19 @@ def _sim_worker(rank: int, gpu: str, shard: list, out_dir: str, model_dir: Path,
             meta = json.loads(json_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
-        score = sim.compute_similarity(encoder, str(ref_audio), str(cloned_wav))
+
+        ref_key = str(ref_audio)
+        cached = ref_emb_cache.get(ref_key, _SENTINEL)
+        if cached is _SENTINEL:
+            ref_emb = encoder.extract_embedding(ref_key)
+            ref_emb_cache[ref_key] = ref_emb
+        else:
+            ref_emb = cached
+        clone_emb = encoder.extract_embedding(str(cloned_wav))
+        if ref_emb is not None and clone_emb is not None:
+            score = sim.cosine_similarity(ref_emb, clone_emb)
+        else:
+            score = None
         record = {
             "cloned_audio": str(cloned_wav),
             "ref_audio": str(ref_audio),
@@ -205,14 +274,17 @@ def main():
     )
     parser.add_argument("--gpu", type=int, default=None, help="Single GPU id")
     parser.add_argument("--gpus", type=str, default=None, help="Comma GPU ids, e.g. 0 or 0,1")
-    parser.add_argument("--workers", type=int, default=4, help="Process count (default 4)")
+    parser.add_argument("--workers", type=int, default=16, help="Process count (default 16, 4 per GPU)")
     parser.add_argument("--sample-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-sidecar", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     args = parser.parse_args()
 
-    gpu_list = parse_gpu_list(args.gpus, args.gpu if args.gpu is not None else 0)
+    if args.gpus is None and args.gpu is None:
+        gpu_list = parse_gpu_list("0,1,2,3")
+    else:
+        gpu_list = parse_gpu_list(args.gpus, args.gpu)
     workers = max(1, args.workers)
 
     pairs = find_clone_pairs(args.out_dir)
