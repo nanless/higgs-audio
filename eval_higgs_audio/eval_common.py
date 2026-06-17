@@ -38,6 +38,16 @@ def append_jsonl(path: Path, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def append_jsonl_lines(path: Path, records: list[dict]) -> None:
+    if not records:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def parse_gpu_list(gpus: str | None = None, gpu: int | None = None) -> List[str]:
     if gpus:
         return [g.strip() for g in gpus.split(",") if g.strip()]

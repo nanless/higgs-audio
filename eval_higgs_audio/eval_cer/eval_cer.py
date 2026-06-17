@@ -36,7 +36,7 @@ import traceback
 import unicodedata
 from collections import defaultdict
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -52,7 +52,7 @@ EVAL_DIR = Path(__file__).resolve().parent
 PARENT_DIR = EVAL_DIR.parent
 sys.path.insert(0, str(PARENT_DIR))
 
-from eval_common import CerAccumulator, append_jsonl, list_clone_items, write_json  # noqa: E402
+from eval_common import CerAccumulator, append_jsonl, append_jsonl_lines, list_clone_items, write_json  # noqa: E402
 
 
 QWEN3_ASR_LOCAL = "/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local"
@@ -67,6 +67,8 @@ DEFAULT_OUT_DIR = Path(
 )
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_AUDIO_WORKERS = 0
+DEFAULT_SIDECAR_WRITERS = 8
+DEFAULT_WRITE_QUEUE_DEPTH = 16
 
 HIGGS_TAG_RE = re.compile(r"<\|[^|>]+\|[^>]*>|<\s*(?:emotion|style|sfx|prosody):[^>]+>", re.IGNORECASE)
 _CJK_CHAR = r"[\u4e00-\u9fff]"
@@ -1081,6 +1083,18 @@ def main():
     )
     parser.add_argument("--prefetch-batches", type=int, default=2, help="ASR batches to prefetch per GPU worker")
     parser.add_argument(
+        "--sidecar-writers",
+        type=int,
+        default=DEFAULT_SIDECAR_WRITERS,
+        help="Parallel threads for .cer.json sidecar writes per batch",
+    )
+    parser.add_argument(
+        "--write-queue-depth",
+        type=int,
+        default=DEFAULT_WRITE_QUEUE_DEPTH,
+        help="Max ASR batches buffered before disk writes (overlap ASR with I/O)",
+    )
+    parser.add_argument(
         "--refresh-asr-cache", action="store_true", help="Ignore existing ASR cache and transcribe all selected items"
     )
     parser.add_argument("--num-shards", type=int, default=1, help="Split work into N deterministic shards")
@@ -1200,8 +1214,7 @@ def main():
     def log_line(msg: str):
         tqdm.write(msg, file=sys.stderr)
 
-    def save_item(item: dict, llm: bool = False):
-        write_eval_json(Path(item["json"]), build_eval_record(item, evaluated_at, llm=llm, model_name=model_name))
+    def build_details_row(item: dict, llm: bool = False) -> dict:
         row = {
             "wav": item["wav"],
             "manual_cer": item["manual_cer"],
@@ -1212,7 +1225,58 @@ def main():
         }
         if llm:
             row["llm_cer"] = item.get("llm_cer", 0)
-        append_jsonl(paths["details_jsonl"], row)
+        return row
+
+    write_queue: queue.Queue = queue.Queue(maxsize=max(1, args.write_queue_depth))
+    writer_errors: list[Exception] = []
+
+    def persist_batch(batch_items: list, llm: bool, stage: str) -> None:
+        records = [build_eval_record(item, evaluated_at, llm=llm, model_name=model_name) for item in batch_items]
+        rows = [build_details_row(item, llm=llm) for item in batch_items]
+
+        def _write_sidecar(pair):
+            item, record = pair
+            write_eval_json(Path(item["json"]), record)
+
+        pairs_zip = list(zip(batch_items, records))
+        if args.sidecar_writers <= 1:
+            for pair in pairs_zip:
+                _write_sidecar(pair)
+        else:
+            with ThreadPoolExecutor(max_workers=args.sidecar_writers) as ex:
+                list(ex.map(_write_sidecar, pairs_zip))
+        append_jsonl_lines(paths["details_jsonl"], rows)
+        with write_lock:
+            detailed.extend(batch_items)
+            if len(detailed) % (CACHE_FLUSH_INTERVAL * batch_size) < len(batch_items):
+                flush_progress(stage)
+
+    def writer_worker():
+        while True:
+            job = write_queue.get()
+            try:
+                if job is None:
+                    return
+                batch_items, llm, stage = job
+                persist_batch(batch_items, llm, stage)
+            except Exception as e:
+                writer_errors.append(e)
+            finally:
+                write_queue.task_done()
+
+    writer_thread = threading.Thread(target=writer_worker, daemon=False)
+    writer_thread.start()
+
+    def enqueue_manual_batch(batch_pairs, stage: str = "asr"):
+        batch_items = build_batch_items(batch_pairs)
+        write_queue.put((batch_items, False, stage))
+
+    def shutdown_writers():
+        write_queue.join()
+        write_queue.put(None)
+        writer_thread.join()
+        if writer_errors:
+            raise writer_errors[0]
 
     def build_batch_items(batch_pairs):
         items = []
@@ -1224,15 +1288,6 @@ def main():
             items.append(item)
             manual_acc.add(item["substitutions"], item["insertions"], item["deletions"], item["chars"])
         return items
-
-    def save_manual_batch(batch_pairs, stage: str = "asr"):
-        with write_lock:
-            batch_items = build_batch_items(batch_pairs)
-            for item in batch_items:
-                detailed.append(item)
-                save_item(item, llm=False)
-            if len(detailed) % (CACHE_FLUSH_INTERVAL * batch_size) < len(batch_pairs):
-                flush_progress(stage)
 
     itn_batch_counter = [0]
 
@@ -1249,22 +1304,20 @@ def main():
                 if itn_batch_counter[0] % CACHE_FLUSH_INTERVAL == 0:
                     flush_json_cache(paths["llm_cache"], llm_cache)
 
-        with write_lock:
-            for item in batch_items:
-                with llm_cache_lock:
-                    llm = llm_cache.get(item["wav"], {})
-                apply_llm_to_item(item, llm, model_name)
-                llm_acc.add(item.get("llm_sub", 0), item.get("llm_ins", 0), item.get("llm_del", 0), item["chars"])
-                detailed.append(item)
-                save_item(item, llm=True)
-            if len(detailed) % (CACHE_FLUSH_INTERVAL * batch_size) < batch_size:
-                flush_progress("itn")
+        for item in batch_items:
+            with llm_cache_lock:
+                llm = llm_cache.get(item["wav"], {})
+            apply_llm_to_item(item, llm, model_name)
+            llm_acc.add(item.get("llm_sub", 0), item.get("llm_ins", 0), item.get("llm_del", 0), item["chars"])
+        persist_batch(batch_items, llm=True, stage="itn")
         log_line(f"  [ITN done w{worker_id}] +{len(batch_items)} total={len(detailed)}")
 
     num_batches = (len(pairs) + batch_size - 1) // batch_size
     print(
         f"\nEvaluating {len(pairs)} clones | batch={batch_size} | "
-        f"asr_gpus={asr_gpu_ids} | llm={'skip' if args.skip_llm else f'{args.llm_concurrency} workers'}\n",
+        f"asr_gpus={asr_gpu_ids} | sidecar_writers={args.sidecar_writers} | "
+        f"write_queue={args.write_queue_depth} | "
+        f"llm={'skip' if args.skip_llm else f'{args.llm_concurrency} workers'}\n",
         flush=True,
     )
 
@@ -1322,7 +1375,7 @@ def main():
                             )
                             with asr_cache_lock:
                                 asr_results.update(new_asr_results)
-                        save_manual_batch(batch, stage="asr")
+                        enqueue_manual_batch(batch, stage="asr")
                         pbar.update(1)
 
                 gpu_batches = {g: [] for g in asr_gpu_ids}
@@ -1337,13 +1390,13 @@ def main():
                 pbar.close()
                 with asr_cache_lock:
                     flush_json_cache(paths["asr_cache"], asr_results)
-                flush_progress("asr")
             else:
                 for bi in tqdm(range(num_batches), desc="Manual ITN"):
                     batch = pairs[bi * batch_size : (bi + 1) * batch_size]
-                    save_manual_batch(batch, stage="asr")
-                flush_progress("asr")
+                    enqueue_manual_batch(batch, stage="asr")
         finally:
+            shutdown_writers()
+            flush_progress("asr")
             if audio_pool is not None:
                 audio_pool.shutdown(wait=True, cancel_futures=True)
             for asr in asr_models.values():
