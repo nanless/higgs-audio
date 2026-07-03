@@ -141,8 +141,7 @@ def _scan_sim_dir(root: str) -> tuple[list[tuple[str, dict]], list[str]]:
             out.append(
                 (
                     wav,
-                    {k: r.get(k) for k in SIM_SIDECAR_FIELDS}
-                    | {"ref_audio": _norm_path(ref) if ref else ref},
+                    {k: r.get(k) for k in SIM_SIDECAR_FIELDS} | {"ref_audio": _norm_path(ref) if ref else ref},
                 )
             )
     return out, errs
@@ -270,9 +269,7 @@ def compare_maps(
         "examples_only_jsonl": only_jsonl[:max_examples],
         "examples_only_sidecar": only_sidecar[:max_examples],
         "examples_value_mismatch": mismatches,
-        "fully_consistent": (
-            len(only_jsonl) == 0 and len(only_sidecar) == 0 and not field_mismatch_counts
-        ),
+        "fully_consistent": (len(only_jsonl) == 0 and len(only_sidecar) == 0 and not field_mismatch_counts),
     }
 
 
