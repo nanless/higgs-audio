@@ -537,7 +537,7 @@ def analyze_prune_breakdown(
 def threshold_matrix(table: list[dict]) -> list[dict]:
     """Count records meeting CER/SIM threshold pairs (for analysis)."""
     cer_thresholds = [0.03, 0.05, 0.08, 0.10, 0.15, 0.20]
-    sim_thresholds = [0.75, 0.80, 0.85, 0.90]
+    sim_thresholds = [0.60, 0.70, 0.75, 0.80, 0.85]  # raw cosine scale
     rows = []
     paired = [r for r in table if r.get("manual_cer") is not None and r.get("similarity") is not None]
     total = len(paired)

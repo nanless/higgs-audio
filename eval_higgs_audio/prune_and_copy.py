@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Delete low-quality Higgs Audio v3 clone audios by CER and SIM thresholds.
 
-Rules:
-  DELETE: CER > 0.03  OR  SIM < 0.85
+Rules (thresholds via --max-cer / --min-sim; SIM is raw cosine):
+  DELETE: CER > 0.03  OR  SIM < 0.8
   KEEP:   otherwise (stay in clone dir)
 
 Fast path (default --source disk):

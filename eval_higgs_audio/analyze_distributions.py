@@ -33,6 +33,8 @@ import numpy as np
 
 from postprocess_common import (
     DEFAULT_CLONE_ROOT,
+    DEFAULT_MAX_CER,
+    DEFAULT_MIN_SIM,
     PRUNE_RULES_TEXT,
     analyze_prune_breakdown,
     build_joined_table,
@@ -135,8 +137,12 @@ def print_text_report(
 
     paired = [r for r in table if r.get("manual_cer") is not None and r.get("similarity") is not None]
     buf.write(f"  Paired records (CER + SIM): {len(paired):,}\n")
-    buf.write(f"  CER-only records:           {sum(1 for r in table if r.get('manual_cer') is not None and r.get('similarity') is None):,}\n")
-    buf.write(f"  SIM-only records:           {sum(1 for r in table if r.get('similarity') is not None and r.get('manual_cer') is None):,}\n\n")
+    buf.write(
+        f"  CER-only records:           {sum(1 for r in table if r.get('manual_cer') is not None and r.get('similarity') is None):,}\n"
+    )
+    buf.write(
+        f"  SIM-only records:           {sum(1 for r in table if r.get('similarity') is not None and r.get('manual_cer') is None):,}\n\n"
+    )
 
     if len(paired) >= 3:
         cer_arr = np.array([r["manual_cer"] for r in paired])
@@ -147,33 +153,29 @@ def print_text_report(
 
     # ── Prune preview ──
     buf.write("\n" + "━" * 72 + "\n")
-    buf.write(" 4. Prune Rule Analysis (CER > 0.03 OR SIM < 0.85 → DELETE)\n")
+    buf.write(f" 4. Prune Rule Analysis (CER > {DEFAULT_MAX_CER} OR SIM < {DEFAULT_MIN_SIM} → DELETE)\n")
     buf.write("━" * 72 + "\n\n")
     buf.write(f"  Rules: {PRUNE_RULES_TEXT}\n\n")
 
     breakdown = analyze_prune_breakdown(table)
     buf.write(f"  Total clones:  {breakdown['total']:>12,}\n")
-    buf.write(
-        f"  DELETE:        {breakdown['delete']:>12,}  ({breakdown['delete_pct']:.2f}%)\n"
-    )
-    buf.write(
-        f"  KEEP:          {breakdown['keep']:>12,}  ({breakdown['keep_pct']:.2f}%)\n\n"
-    )
+    buf.write(f"  DELETE:        {breakdown['delete']:>12,}  ({breakdown['delete_pct']:.2f}%)\n")
+    buf.write(f"  KEEP:          {breakdown['keep']:>12,}  ({breakdown['keep_pct']:.2f}%)\n\n")
 
     reasons = breakdown["delete_reasons"]
     buf.write("  ── DELETE trigger breakdown (paired records) ──\n")
-    buf.write(f"    CER > 0.03 only:  {reasons['cer_only']:>10,}\n")
-    buf.write(f"    SIM < 0.85 only:  {reasons['sim_only']:>10,}\n")
+    buf.write(f"    CER > {DEFAULT_MAX_CER} only:  {reasons['cer_only']:>10,}\n")
+    buf.write(f"    SIM < {DEFAULT_MIN_SIM} only:  {reasons['sim_only']:>10,}\n")
     buf.write(f"    Both failed:      {reasons['both']:>10,}\n")
     buf.write(f"    ({reasons['note']})\n\n")
 
     quad = breakdown["quadrants"]
     buf.write("  ── Quadrant view (records with both CER + SIM) ──\n")
     buf.write(
-        f"    KEEP zone  (CER≤0.03 & SIM≥0.85): {quad['keep_ok']:>10,}  "
-        f"({100*quad['keep_ok']/len(paired):.2f}% of paired)\n"
+        f"    KEEP zone  (CER≤{DEFAULT_MAX_CER} & SIM≥{DEFAULT_MIN_SIM}): {quad['keep_ok']:>10,}  "
+        f"({100 * quad['keep_ok'] / len(paired):.2f}% of paired)\n"
         if paired
-        else f"    KEEP zone  (CER≤0.03 & SIM≥0.85): {quad['keep_ok']:>10,}\n"
+        else f"    KEEP zone  (CER≤{DEFAULT_MAX_CER} & SIM≥{DEFAULT_MIN_SIM}): {quad['keep_ok']:>10,}\n"
     )
     buf.write(f"    DELETE / CER only:                  {quad['delete_cer_only']:>10,}\n")
     buf.write(f"    DELETE / SIM only:                  {quad['delete_sim_only']:>10,}\n")
@@ -194,20 +196,14 @@ def print_text_report(
     )
 
     preview = classify_records(table)
-    buf.write(
-        f"  Missing CER: {preview['missing_cer']:,}  "
-        f"Missing SIM: {preview['missing_sim']:,}\n\n"
-    )
+    buf.write(f"  Missing CER: {preview['missing_cer']:,}  Missing SIM: {preview['missing_sim']:,}\n\n")
 
     buf.write("  ── By Dataset (DELETE / KEEP / rate) ──\n")
     buf.write(
         f"  {'Dataset':<24s} {'Total':>10s} {'DELETE':>10s} {'KEEP':>10s} "
         f"{'Del%':>7s} {'CER↓':>8s} {'SIM↓':>8s} {'Both':>8s}\n"
     )
-    buf.write(
-        f"  {'─' * 24} {'─' * 10} {'─' * 10} {'─' * 10} "
-        f"{'─' * 7} {'─' * 8} {'─' * 8} {'─' * 8}\n"
-    )
+    buf.write(f"  {'─' * 24} {'─' * 10} {'─' * 10} {'─' * 10} {'─' * 7} {'─' * 8} {'─' * 8} {'─' * 8}\n")
     for row in breakdown["by_dataset"]:
         buf.write(
             f"  {row['dataset']:<24s} {row['total']:>10,} {row['delete']:>10,} "
@@ -231,13 +227,10 @@ def print_text_report(
     buf.write(" 5. Threshold Matrix (CER <= X AND SIM > Y)\n")
     buf.write("━" * 72 + "\n\n")
     matrix = threshold_matrix(table)
-    buf.write(f"  {'CER<=' :>7s} {'SIM>' :>6s} {'Count':>12s} {'Pct':>8s}\n")
+    buf.write(f"  {'CER<=':>7s} {'SIM>':>6s} {'Count':>12s} {'Pct':>8s}\n")
     buf.write(f"  {'─' * 7} {'─' * 6} {'─' * 12} {'─' * 8}\n")
     for row in matrix:
-        buf.write(
-            f"  {row['cer_max']:>7.2f} {row['sim_min']:>6.2f} "
-            f"{row['count']:>12,} {row['pct']:>7.2f}%\n"
-        )
+        buf.write(f"  {row['cer_max']:>7.2f} {row['sim_min']:>6.2f} {row['count']:>12,} {row['pct']:>7.2f}%\n")
 
     # ── Summary table ──
     buf.write("\n" + "━" * 72 + "\n")
@@ -281,8 +274,7 @@ def build_json_report(cer_records: list[dict], sim_records: list[dict], table: l
         overall = compute_stats(values)
         overall["histogram"] = histogram_bins(values)
         by_dataset = {
-            ds: compute_stats(vals)
-            for ds, vals in sorted(_group_metric(records, metric_key, "dataset").items())
+            ds: compute_stats(vals) for ds, vals in sorted(_group_metric(records, metric_key, "dataset").items())
         }
         by_language = {
             lang: compute_stats(vals)
