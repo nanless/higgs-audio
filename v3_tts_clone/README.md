@@ -91,13 +91,16 @@ Step 2 × 10:
   ├ 生成本轮 CSV (05_generate_round_csv.py): per_round = ceil(原始/10)
   ├ 克隆 (03_tts_clone.py --post-prune)
   ├ 停止 TTS → 释放 GPU
-  ├ CER 评估 (--skip-existing --refresh-scan, batch/audio-workers/语言分组) → pkill eval_cer.py 释放 GPU
   ├ SIM 评估 (--skip-existing) → pkill eval_sim.py 释放 GPU
-  ├ 剪枝 (读 per-clone sidecar, CER>0.03 或 SIM<0.85)
+  ├ SIM 剪枝 (只按 SIM<0.85 删一波, --max-cer 999 关闭 CER 判定; 缩小 CER 待评集)
+  ├ CER 评估 (SIM 存活集; --skip-existing --refresh-scan, batch/audio-workers/语言分组) → pkill eval_cer.py 释放 GPU
+  ├ CER 剪枝 (CER>0.03 或 SIM<0.85, 读 per-clone sidecar)
   └ 统计 (归档本轮 existing_clones_after.json)
 
 最终  04 最终统计 + verify_kept_clones.py 质量验证 + 各轮汇总
 ```
+
+> **评估顺序 = SIM 先, CER 后**: SIM 快, 先删掉说话人相似度不达标的一批, 再对存活集跑昂贵的 ASR/CER, 显著减少 ASR 量。`START_STEP` 顺序: `clone(1) < sim(2) < cer(3)`。
 
 > Step 1a 仅扫描 `CLONE_ROOT` 用于日志展示；`04` 会自己扫描 `--clone-root` 计入 clone 时长，两者不叠加。
 
@@ -119,7 +122,13 @@ Step 2 × 10:
 
 ## 评估提速 (CER)
 
-- `ASR_BATCH_SIZE=32`（A800 80GB 充裕, 原 16 欠载）、`ASR_AUDIO_WORKERS=16`（音频解码并行, 与 GPU 重叠）、语言预分组（`--group-by-language`, 让每个 batch 尽量单语言、跑满）、`ASR_MAX_NEW_TOKENS=512`（原 256 会截断长音频转写）。
+- **`ASR_BACKEND=vllm`（默认，推荐）**：CER 用 vLLM 后端（`Qwen3ASRModel.LLM`，`tensor_parallel_size`=卡数），连续批处理把 GPU 吃满。旧的 `transformers` 后端用「单进程多线程」驱动多卡受 GIL 限制、`model.generate` 自回归解码利用率低。已验证 vLLM 与 transformers 转写结果逐条一致（CER 等价）。
+- `ASR_VLLM_BATCH=256`（喂给 vLLM 引擎的批, 越大越能填满）、`ASR_GPU_MEM_UTIL=0.9`。
+- 通用: `ASR_AUDIO_WORKERS=16`（音频解码并行, 与 GPU 重叠）、`ASR_MAX_NEW_TOKENS=512`（原 256 会截断长音频转写）。
+- 语言预分组: transformers 用 `--group-by-language`（防子批变小）；**vllm 用 `--no-group-by-language`**（对混合语言不敏感, 省掉全量 json 预扫）。
+- `ASR_BATCH_SIZE=32` 仅在 `ASR_BACKEND=transformers` 时用。
+- **全盘扫描全部多进程加速（`SCAN_WORKERS=64`）**：`05_scan_existing_clones`（→7s）、CER 扫描（`list_clone_items` 无-meta, 79s→3s）、prune 扫描（0.5s）、SIM 扫描（20s, 需读 ref）。每轮多次全树扫描不再是瓶颈。
+- vLLM 驱动用单独后台线程做 manual ITN, 与下一批 transcribe 重叠 (GPU 不空转)。
 
 ## ⚠️ 长文本被截断 → 过度剪枝 (排查结论)
 

@@ -89,7 +89,7 @@ def _fast_scan_speaker(speaker_dir: str) -> List[Tuple[str, str, str]]:
     return results
 
 
-def find_clone_pairs(out_dir: Path, scan_workers: int = 16) -> List[Tuple[Path, Path, Path]]:
+def find_clone_pairs(out_dir: Path, scan_workers: int = 32) -> List[Tuple[Path, Path, Path]]:
     """Fast scan for (cloned_wav, ref_audio, sidecar_json) triples.
 
     Only stats files/dirs — does NOT read JSON content during scan.
@@ -280,6 +280,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=None, help="Single GPU id")
     parser.add_argument("--gpus", type=str, default=None, help="Comma GPU ids, e.g. 0 or 0,1")
     parser.add_argument("--workers", type=int, default=16, help="Process count (default 16, 4 per GPU)")
+    parser.add_argument("--scan-workers", type=int, default=32, help="Parallel workers for the clone dir scan")
     parser.add_argument("--sample-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-sidecar", action="store_true")
@@ -292,7 +293,7 @@ def main():
         gpu_list = parse_gpu_list(args.gpus, args.gpu)
     workers = max(1, args.workers)
 
-    pairs = find_clone_pairs(args.out_dir)
+    pairs = find_clone_pairs(args.out_dir, scan_workers=args.scan_workers)
     if not pairs:
         print("No cloned audio pairs found.", flush=True)
         return

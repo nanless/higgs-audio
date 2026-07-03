@@ -166,7 +166,7 @@ def main():
         help="disk=scan existing wavs only (fast); eval=all eval DELETE paths (slow)",
     )
     parser.add_argument("--workers", type=int, default=32, help="Parallel delete workers")
-    parser.add_argument("--scan-workers", type=int, default=16, help="Parallel scan workers")
+    parser.add_argument("--scan-workers", type=int, default=32, help="Parallel scan workers")
     parser.add_argument(
         "--eval-source",
         choices=("sidecar", "jsonl"),

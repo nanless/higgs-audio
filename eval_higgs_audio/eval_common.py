@@ -169,10 +169,48 @@ def iter_clone_records(out_dir: Path, workers: int = 8) -> Iterator[Tuple[Path, 
                 yield Path(wav_s), Path(json_s), meta
 
 
-def list_clone_items(out_dir: Path, label: str = "scan", scan_workers: int = 8) -> List[Tuple[Path, Path]]:
+def _clone_speaker_subdirs(out_dir: Path) -> List[str]:
+    """All dataset/speaker dirs (two-level) or dataset dirs (one-level) under a clone root."""
+    subdirs: List[str] = []
+    for p in out_dir.iterdir():
+        if p.is_dir() and p.name not in SKIP_DIRS:
+            try:
+                spk = [str(sd) for sd in p.iterdir() if sd.is_dir() and sd.name not in SKIP_DIRS]
+            except OSError:
+                spk = []
+            subdirs.extend(spk if spk else [str(p)])
+    return subdirs
+
+
+def _scan_dir_pairs(root: str) -> List[Tuple[str, str]]:
+    """Fast: list (wav, json) clone pairs WITHOUT reading json meta (stat only)."""
+    out: List[Tuple[str, str]] = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for name in files:
+            if not _is_clone_sidecar(name):
+                continue
+            jp = os.path.join(dirpath, name)
+            wp = jp[:-5] + ".wav"  # ".json" -> ".wav"
+            if os.path.isfile(wp):
+                out.append((wp, jp))
+    return out
+
+
+def list_clone_items(out_dir: Path, label: str = "scan", scan_workers: int = 32) -> List[Tuple[Path, Path]]:
+    """Fast (wav, json) scan: parallel over speaker dirs, no json meta read."""
+    out_dir = Path(out_dir)
     t0 = time.time()
-    items = [(w, j) for w, j, _ in iter_clone_records(out_dir, workers=scan_workers)]
-    print(f"[{label}] {len(items)} clones in {time.time() - t0:.1f}s", flush=True)
+    subdirs = _clone_speaker_subdirs(out_dir)
+    items: List[Tuple[Path, Path]] = []
+    if len(subdirs) > 1 and scan_workers > 1:
+        with ProcessPoolExecutor(max_workers=min(scan_workers, len(subdirs))) as ex:
+            for batch in ex.map(_scan_dir_pairs, subdirs, chunksize=16):
+                items.extend((Path(w), Path(j)) for w, j in batch)
+    else:
+        for sd in subdirs:
+            items.extend((Path(w), Path(j)) for w, j in _scan_dir_pairs(sd))
+    print(f"[{label}] {len(items)} clones in {time.time() - t0:.1f}s ({scan_workers}p, no-meta)", flush=True)
     return items
 
 

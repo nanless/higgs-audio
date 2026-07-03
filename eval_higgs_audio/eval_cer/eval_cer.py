@@ -57,6 +57,12 @@ from eval_common import CerAccumulator, append_jsonl, append_jsonl_lines, list_c
 
 QWEN3_ASR_LOCAL = "/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local"
 ENV_FILE = EVAL_DIR / ".env"
+
+
+class _AsrDone(Exception):
+    """Sentinel to short-circuit the transformers ASR path once the vLLM path finished."""
+
+
 DEFAULT_OUT_DIR = Path(
     os.environ.get(
         "HIGGS_CLONE_ROOT",
@@ -907,6 +913,31 @@ def load_asr_model(batch_size: int = 16, gpu_id: int = 0, max_new_tokens: int = 
     return asr
 
 
+def load_asr_model_vllm(
+    gpu_ids: list, batch_size: int = 256, max_new_tokens: int = 512, gpu_mem_util: float = 0.9, tp: int = 0
+):
+    """vLLM backend: one engine with tensor-parallel over the visible GPUs (continuous batching).
+    Assumes CUDA_VISIBLE_DEVICES already pins the engine to gpu_ids."""
+    sys.path.insert(0, "/root/code/github_repos/Qwen3-ASR")
+    from qwen_asr import Qwen3ASRModel
+
+    tp = tp or len(gpu_ids)
+    print(
+        f"Loading Qwen3-ASR vLLM engine (tp={tp}, gpu_mem_util={gpu_mem_util}, "
+        f"max_inference_batch_size={batch_size}, max_new_tokens={max_new_tokens})...",
+        flush=True,
+    )
+    asr = Qwen3ASRModel.LLM(
+        model=QWEN3_ASR_LOCAL,
+        tensor_parallel_size=tp,
+        gpu_memory_utilization=gpu_mem_util,
+        max_inference_batch_size=batch_size,
+        max_new_tokens=max_new_tokens,
+    )
+    print("vLLM ASR engine ready.\n", flush=True)
+    return asr
+
+
 def transcribe_asr_batch(
     asr,
     batch_pairs: list,
@@ -1057,7 +1088,7 @@ def summarize_cer(details: list, ref_key: str = "ref_manual", hyp_key: str = "hy
 CACHE_FLUSH_INTERVAL = 50
 
 
-def load_scan_cache(out_dir: Path, refresh: bool = False) -> list[tuple[Path, Path]]:
+def load_scan_cache(out_dir: Path, refresh: bool = False, scan_workers: int = 32) -> list[tuple[Path, Path]]:
     cache_path = out_dir / "eval_higgs_scan_cache.pkl"
     if not refresh and cache_path.exists():
         pairs = pickle.loads(cache_path.read_bytes())
@@ -1067,7 +1098,7 @@ def load_scan_cache(out_dir: Path, refresh: bool = False) -> list[tuple[Path, Pa
             return pairs
         print("[scan-cache] stale cache, re-scanning...", flush=True)
 
-    pairs = list_clone_items(out_dir, label="cer-scan")
+    pairs = list_clone_items(out_dir, label="cer-scan", scan_workers=scan_workers)
     if pairs:
         cache_path.write_bytes(pickle.dumps(pairs))
         print(f"[scan-cache] saved {len(pairs)} pairs to {cache_path.name}", flush=True)
@@ -1110,6 +1141,24 @@ def main():
         help="ASR decode token cap (was 256, which clipped long clips; free for short ones since decode stops at EOS)",
     )
     parser.add_argument(
+        "--asr-backend",
+        choices=("transformers", "vllm"),
+        default="transformers",
+        help="ASR backend. vllm=continuous batching (much higher GPU util); transformers=HF generate (per-GPU threads)",
+    )
+    parser.add_argument(
+        "--asr-tp",
+        type=int,
+        default=0,
+        help="vLLM tensor_parallel_size (0 = number of --asr-gpus)",
+    )
+    parser.add_argument(
+        "--asr-gpu-mem-util",
+        type=float,
+        default=0.9,
+        help="vLLM gpu_memory_utilization",
+    )
+    parser.add_argument(
         "--group-by-language",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1146,6 +1195,7 @@ def main():
     )
     parser.add_argument("--refresh-llm-cache", action="store_true")
     parser.add_argument("--refresh-scan", action="store_true", help="Force re-scan (ignore scan cache)")
+    parser.add_argument("--scan-workers", type=int, default=32, help="Parallel workers for the clone dir scan")
     args = parser.parse_args()
     args.skip_llm = not args.enable_llm or args.skip_llm
 
@@ -1154,13 +1204,16 @@ def main():
     random.seed(args.seed)
 
     asr_gpu_ids = [int(g.strip()) for g in args.asr_gpus.split(",") if g.strip()]
+    if args.asr_backend == "vllm":
+        # Pin vLLM to exactly the requested GPUs (TP = number of them). Must be set before CUDA init.
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.asr_gpus
     if args.num_shards < 1:
         raise ValueError("--num-shards must be >= 1")
     if not 0 <= args.shard_index < args.num_shards:
         raise ValueError("--shard-index must be in [0, num-shards)")
     shard_suffix = args.shard_index if args.num_shards > 1 else None
 
-    pairs = load_scan_cache(args.out_dir, refresh=args.refresh_scan)
+    pairs = load_scan_cache(args.out_dir, refresh=args.refresh_scan, scan_workers=args.scan_workers)
     if not pairs:
         print("No clone audio found.", flush=True)
         return
@@ -1377,7 +1430,54 @@ def main():
                 flush=True,
             )
 
+        vllm_asr = None
         try:
+            if need_asr and args.asr_backend == "vllm":
+                # vLLM: one engine, single-threaded driver feeding large batches.
+                # vLLM does continuous batching internally across the TP GPUs -> high GPU util,
+                # no GIL contention (unlike the transformers per-GPU thread path).
+                vllm_asr = load_asr_model_vllm(
+                    asr_gpu_ids,
+                    batch_size=batch_size,
+                    max_new_tokens=args.asr_max_new_tokens,
+                    gpu_mem_util=args.asr_gpu_mem_util,
+                    tp=args.asr_tp,
+                )
+                # Single background ITN consumer: manual ITN (CPU/regex) overlaps the next
+                # vLLM transcribe (which releases the GIL in C++/CUDA), so the GPU isn't idle
+                # during ITN. Single consumer -> manual_acc stays race-free.
+                itn_q: queue.Queue = queue.Queue(maxsize=8)
+
+                def _itn_consumer():
+                    while True:
+                        b = itn_q.get()
+                        try:
+                            if b is None:
+                                return
+                            enqueue_manual_batch(b, stage="asr")
+                        finally:
+                            itn_q.task_done()
+
+                itn_thread = threading.Thread(target=_itn_consumer, daemon=True)
+                itn_thread.start()
+                pbar = tqdm(total=num_batches, desc="ASR(vLLM)+Manual")
+                for bi in range(num_batches):
+                    batch = pairs[bi * batch_size : (bi + 1) * batch_size]
+                    need = [(w, j) for w, j in batch if not has_cached_asr_text(asr_results, w, j)]
+                    if need:
+                        new_asr_results = {}
+                        transcribe_asr_batch(vllm_asr, need, new_asr_results, audio_pool=audio_pool)
+                        with asr_cache_lock:
+                            asr_results.update(new_asr_results)
+                    itn_q.put(batch)
+                    pbar.update(1)
+                itn_q.put(None)
+                itn_thread.join()
+                pbar.close()
+                flush_json_cache(paths["asr_cache"], asr_results)
+                # skip the transformers path below
+                raise _AsrDone()
+
             if need_asr:
                 for gpu_id in asr_gpu_ids:
                     asr_models[gpu_id] = load_asr_model(
@@ -1441,6 +1541,8 @@ def main():
                 for bi in tqdm(range(num_batches), desc="Manual ITN"):
                     batch = pairs[bi * batch_size : (bi + 1) * batch_size]
                     enqueue_manual_batch(batch, stage="asr")
+        except _AsrDone:
+            pass
         finally:
             shutdown_writers()
             flush_progress("asr")
@@ -1448,6 +1550,7 @@ def main():
                 audio_pool.shutdown(wait=True, cancel_futures=True)
             for asr in asr_models.values():
                 del asr
+            del vllm_asr
             torch.cuda.empty_cache()
     else:
         batch_queue: queue.Queue = queue.Queue(maxsize=args.llm_concurrency * 6)

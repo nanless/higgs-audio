@@ -4,7 +4,8 @@
 #
 # 流程:
 #   1. 一次性分配预算 (04_post_prune_stats.py)
-#   2. 每轮: 扫描磁盘现有 clone → 限制克隆量为 1/N → 克隆 → CER → SIM → 剪枝
+#   2. 每轮: 扫描磁盘现有 clone → 限制克隆量为 1/N → 克隆 → SIM评估→SIM剪枝 → CER评估→CER剪枝
+#      (先用快的 SIM 删一波, 缩小昂贵的 ASR/CER 工作量)
 #   3. 重复 N 轮，不重新分配预算
 #
 # 用法:
@@ -22,12 +23,13 @@
 #   NUM_SERVERS        — SGLang 服务数量 (默认 8)
 #   WORKERS_PER_SERVER — 每 server 并发数 (默认 16)
 #   START_ROUND        — 从第几轮开始 (默认 1)
-#   START_STEP         — 起始轮从哪步开始: clone|cer|sim|prune (默认 clone)
+#   START_STEP         — 起始轮从哪步开始: clone|sim|cer (默认 clone; SIM 在前, CER 在后)
 #
 # 续跑示例 (复用前面已跑出的结果):
-#   START_ROUND=1 START_STEP=cer   bash 05_iterative_pipeline.sh  # 第1轮从 CER 评估开始
+#   START_ROUND=1 START_STEP=sim   bash 05_iterative_pipeline.sh  # 第1轮从 SIM 评估开始(克隆已完成)
+#   START_ROUND=1 START_STEP=cer   bash 05_iterative_pipeline.sh  # 第1轮从 CER 评估开始(SIM也已完成)
 #   START_ROUND=3                  bash 05_iterative_pipeline.sh  # 直接从第3轮的克隆开始
-#   START_ROUND=3 START_STEP=sim   bash 05_iterative_pipeline.sh  # 第3轮从 SIM 评估开始
+# 步骤顺序/级别: clone=1 < sim=2 < cer=3 (SIM 在前, CER 在后)
 # (START_ROUND>1 或 START_STEP!=clone 时跳过 ASR + 预算分配, 复用已有分配基准与磁盘 clone)
 # =============================================================================
 
@@ -57,11 +59,15 @@ QUALITY_PASS_RATE="${QUALITY_PASS_RATE:-0.5}"
 MAX_CER="${MAX_CER:-0.03}"
 MIN_SIM="${MIN_SIM:-0.85}"
 ALL_GPUS="${ALL_GPUS:-0,1,2,3}"
-ASR_BATCH_SIZE="${ASR_BATCH_SIZE:-32}"
+ASR_BACKEND="${ASR_BACKEND:-vllm}"          # vllm (连续批处理, 高 GPU 利用率) | transformers
+ASR_BATCH_SIZE="${ASR_BATCH_SIZE:-32}"       # transformers 后端每卡 batch
+ASR_VLLM_BATCH="${ASR_VLLM_BATCH:-256}"      # vllm 后端喂给引擎的批大小 (越大越能填满连续批处理)
+ASR_GPU_MEM_UTIL="${ASR_GPU_MEM_UTIL:-0.9}"  # vllm gpu_memory_utilization
 ASR_AUDIO_WORKERS="${ASR_AUDIO_WORKERS:-16}"
 ASR_MAX_NEW_TOKENS="${ASR_MAX_NEW_TOKENS:-512}"
 TTS_MAX_NEW_TOKENS="${TTS_MAX_NEW_TOKENS:-1024}"
 PRUNE_WORKERS="${PRUNE_WORKERS:-32}"
+SCAN_WORKERS="${SCAN_WORKERS:-64}"    # 全盘扫描并行进程数 (128 核, 网络盘 I/O 密集, 用大值猛猛加速)
 SEED="${SEED:-42}"
 START_ROUND="${START_ROUND:-1}"
 START_STEP="${START_STEP:-clone}"
@@ -82,13 +88,12 @@ echo "=============================================="
 echo ""
 
 # ---- 续跑控制: START_ROUND / START_STEP ----
-# 步骤级别: clone=1 < cer=2 < sim=3 < prune=4; 只运行 level >= 起始 level 的步骤
+# 步骤级别: clone=1 < sim=2 < cer=3 (SIM 在前, CER 在后); 起始轮只运行 level >= 起始 level 的步骤
 case "${START_STEP}" in
     clone) START_STEP_LEVEL=1 ;;
-    cer)   START_STEP_LEVEL=2 ;;
-    sim)   START_STEP_LEVEL=3 ;;
-    prune) START_STEP_LEVEL=4 ;;
-    *) echo "❌ START_STEP 非法: '${START_STEP}' (可选: clone|cer|sim|prune)"; exit 1 ;;
+    sim)   START_STEP_LEVEL=2 ;;
+    cer)   START_STEP_LEVEL=3 ;;
+    *) echo "❌ START_STEP 非法: '${START_STEP}' (可选: clone|sim|cer)"; exit 1 ;;
 esac
 
 # 续跑模式: START_ROUND>1 或 起始轮不从 clone 开始 → 跳过 ASR + 预算分配, 复用已有结果
@@ -416,6 +421,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
     python ${V3_CLONE_DIR}/05_scan_existing_clones.py \
         --clone-root ${CLONE_ROOT} \
         --resume-csv ${FULL_RESUME_CSV} \
+        --workers ${SCAN_WORKERS} \
         --out-json ${EXISTING_CLONES_JSON}
 
     # ================= 2a: 克隆 (clone, level 1) =================
@@ -492,63 +498,90 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
         echo "  ⏭  跳过克隆 (START_STEP=${START_STEP}), 复用磁盘已有 clone"
     fi
 
-    # ================= 2b: CER 评估 (cer, level 2) =================
+    # ================= 2b: SIM 评估 + SIM 剪枝 (sim, level 2) =================
+    # 先跑快的 SIM, 用 SIM 删一波 (缩小后面昂贵的 ASR/CER 工作量)
     if [ "${cur_start_level}" -le 2 ]; then
-        # 全部4卡, 强制刷新扫描缓存, 防止剪枝后缓存失效
-        run_or_fail "CER 评估" \
-            "bash ${EVAL_CER_DIR}/run_eval_cer.sh \
-                --out-dir ${CLONE_ROOT} \
-                --skip-existing \
-                --refresh-scan \
-                --asr-gpus ${ALL_GPUS} \
-                --batch-size ${ASR_BATCH_SIZE} \
-                --audio-workers ${ASR_AUDIO_WORKERS} \
-                --asr-max-new-tokens ${ASR_MAX_NEW_TOKENS} \
-                --group-by-language" || echo "⚠️  CER 评估失败，跳过剪枝，继续下一轮"
-
-        # 释放 CER (ASR) 占用的 GPU, 防止残留进程影响 SIM 评估
-        pkill -f "eval_cer.py" 2>/dev/null || true
-        sleep 5
-        echo "  ✅ CER 评估进程已释放 GPU"
-    else
-        echo "  ⏭  跳过 CER 评估 (START_STEP=${START_STEP}), 复用已有 .cer.json"
-    fi
-
-    # ================= 2c: SIM 评估 (sim, level 3) =================
-    if [ "${cur_start_level}" -le 3 ]; then
         # 全部4卡, 每次全新 os.walk 扫描
         run_or_fail "SIM 评估" \
             "bash ${EVAL_SIM_DIR}/run_eval_sim.sh \
                 --out-dir ${CLONE_ROOT} \
                 --skip-existing \
                 --gpus ${ALL_GPUS} \
-                --workers 4" || echo "⚠️  SIM 评估失败，跳过剪枝，继续下一轮"
+                --scan-workers ${SCAN_WORKERS} \
+                --workers 4" || echo "⚠️  SIM 评估失败，跳过 SIM 剪枝，继续 CER"
 
-        # 释放 SIM 占用的 GPU, 防止残留 (含 spawn worker) 影响剪枝/下一轮 TTS
+        # 释放 SIM 占用的 GPU, 防止残留 (含 spawn worker) 影响后续 CER/TTS
         pkill -f "eval_sim.py" 2>/dev/null || true
         sleep 5
         echo "  ✅ SIM 评估进程已释放 GPU"
+
+        # SIM 剪枝: 只按 SIM 删 (--max-cer 999 关闭 CER 判定), 缩小 CER 待评估集
+        log_step "PRUNE-SIM" "SIM 剪枝 (SIM<${MIN_SIM}, 先删一波再跑 ASR)"
+        run_or_fail "Prune(SIM)" \
+            "python ${EVAL_DIR}/prune_and_copy.py \
+                --out-dir ${CLONE_ROOT} \
+                --max-cer 999 \
+                --min-sim ${MIN_SIM} \
+                --eval-source sidecar \
+                --eval-workers ${PRUNE_WORKERS} \
+                --scan-workers ${SCAN_WORKERS} \
+                --workers ${PRUNE_WORKERS}" || echo "⚠️  SIM 剪枝失败，继续 CER"
     else
-        echo "  ⏭  跳过 SIM 评估 (START_STEP=${START_STEP}), 复用已有 .sim.json"
+        echo "  ⏭  跳过 SIM 评估/剪枝 (START_STEP=${START_STEP}), 复用已有 .sim.json"
     fi
 
-    # ================= 2d: 剪枝 (prune, level 4) =================
-    # 按阈值删除低质量 clone + 所有 sidecar
-    log_step "PRUNE" "剪枝低质量 clone (CER>${MAX_CER} 或 SIM<${MIN_SIM})"
-    run_or_fail "Prune" \
-        "python ${EVAL_DIR}/prune_and_copy.py \
-            --out-dir ${CLONE_ROOT} \
-            --max-cer ${MAX_CER} \
-            --min-sim ${MIN_SIM} \
-            --eval-source sidecar \
-            --eval-workers ${PRUNE_WORKERS} \
-            --workers ${PRUNE_WORKERS}" || echo "⚠️  剪枝失败，继续下一轮"
+    # ================= 2c: CER 评估 + CER 剪枝 (cer, level 3) =================
+    if [ "${cur_start_level}" -le 3 ]; then
+        # 全部4卡, 强制刷新扫描缓存 (SIM 剪枝已删文件, 缓存必失效); 只评估 SIM 存活的 clone
+        # vllm 后端用连续批处理 (TP=卡数) 填满 GPU; batch 用较大的 ASR_VLLM_BATCH
+        # 语言预分组对 transformers 有用(防子批变小), 对 vllm 收益小且要预扫全部 json → vllm 关掉
+        if [ "${ASR_BACKEND}" = "vllm" ]; then
+            CER_BATCH="${ASR_VLLM_BATCH}"
+            LANG_GROUP_ARG="--no-group-by-language"
+        else
+            CER_BATCH="${ASR_BATCH_SIZE}"
+            LANG_GROUP_ARG="--group-by-language"
+        fi
+        run_or_fail "CER 评估" \
+            "bash ${EVAL_CER_DIR}/run_eval_cer.sh \
+                --out-dir ${CLONE_ROOT} \
+                --skip-existing \
+                --refresh-scan \
+                --scan-workers ${SCAN_WORKERS} \
+                --asr-backend ${ASR_BACKEND} \
+                --asr-gpus ${ALL_GPUS} \
+                --asr-gpu-mem-util ${ASR_GPU_MEM_UTIL} \
+                --batch-size ${CER_BATCH} \
+                --audio-workers ${ASR_AUDIO_WORKERS} \
+                --asr-max-new-tokens ${ASR_MAX_NEW_TOKENS} \
+                ${LANG_GROUP_ARG}" || echo "⚠️  CER 评估失败，跳过 CER 剪枝，继续下一轮"
+
+        # 释放 CER (ASR) 占用的 GPU
+        pkill -f "eval_cer.py" 2>/dev/null || true
+        sleep 5
+        echo "  ✅ CER 评估进程已释放 GPU"
+
+        # CER 剪枝: 完整阈值 (SIM 存活里再删 CER>${MAX_CER}; SIM 已合格)
+        log_step "PRUNE-CER" "CER 剪枝 (CER>${MAX_CER} 或 SIM<${MIN_SIM})"
+        run_or_fail "Prune(CER)" \
+            "python ${EVAL_DIR}/prune_and_copy.py \
+                --out-dir ${CLONE_ROOT} \
+                --max-cer ${MAX_CER} \
+                --min-sim ${MIN_SIM} \
+                --eval-source sidecar \
+                --eval-workers ${PRUNE_WORKERS} \
+                --scan-workers ${SCAN_WORKERS} \
+                --workers ${PRUNE_WORKERS}" || echo "⚠️  CER 剪枝失败，继续下一轮"
+    else
+        echo "  ⏭  跳过 CER 评估/剪枝 (START_STEP=${START_STEP}), 复用已有 .cer.json"
+    fi
 
     # 剪枝后统计本轮保留多少
     log_step "STATS" "本轮后统计"
     python ${V3_CLONE_DIR}/05_scan_existing_clones.py \
         --clone-root ${CLONE_ROOT} \
         --resume-csv ${FULL_RESUME_CSV} \
+        --workers ${SCAN_WORKERS} \
         --out-json ${ROUND_DIR}/existing_clones_after.json
     python -c "
 import json

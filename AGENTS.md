@@ -300,7 +300,7 @@ tail -f clone_workdir/iterative_pipeline/pipeline_*.log
    - `05_generate_round_csv.py` 生成本轮 CSV：`clones_needed = min(ceil(原始/N), 原始-已有)`，`start_clone_idx = 基数+已有`
    - `03_tts_clone.py --post-prune --seed $((SEED + round*1000000))` 克隆（**每轮 seed 不同**，保证尾部被剪枝编号被复用时文本/参考仍不同；同轮内确定可续跑）
    - **`pkill -f "sgl-omni serve"` 停止 TTS 释放 GPU** 给评估
-   - CER 评估（`--refresh-scan` 防剪枝后 pickle 缓存失效；`--batch-size 32 --audio-workers 16 --group-by-language --asr-max-new-tokens 512` 提速）→ **`pkill -f eval_cer.py` 释放 GPU** → SIM 评估 → **`pkill -f eval_sim.py` 释放 GPU** → `prune_and_copy.py --eval-source sidecar`（读 per-clone sidecar）剪枝（CER>0.03 或 SIM<0.85）
+   - **评估顺序 SIM 先、CER 后**（SIM 快，先删一波缩小昂贵的 ASR 量）：SIM 评估 → **`pkill -f eval_sim.py` 释放 GPU** → SIM 剪枝（`--max-cer 999` 只按 SIM<0.85 删）→ CER 评估（SIM 存活集；`--refresh-scan` 防缓存失效；`--batch-size 32 --audio-workers 16 --group-by-language --asr-max-new-tokens 512` 提速）→ **`pkill -f eval_cer.py` 释放 GPU** → CER 剪枝（CER>0.03 或 SIM<0.85）。两次剪枝均 `--eval-source sidecar`。`START_STEP` 级别：`clone=1<sim=2<cer=3`
    - 失败的评估/剪枝只 warning，继续下一轮
 7. **最终**：`04_post_prune_stats.py` 最终统计 + `verify_kept_clones.py` 质量验证 + 各轮汇总
 
@@ -314,12 +314,12 @@ tail -f clone_workdir/iterative_pipeline/pipeline_*.log
 
 ### 续跑 / 从指定轮·步开始（`START_ROUND` / `START_STEP`）
 
-- `START_ROUND`（默认 1）+ `START_STEP`（默认 `clone`，可选 `clone|cer|sim|prune`）。步骤级别 `clone=1<cer=2<sim=3<prune=4`
+- `START_ROUND`（默认 1）+ `START_STEP`（默认 `clone`，可选 `clone|sim|cer`）。步骤级别 `clone=1<sim=2<cer=3`（SIM 在前、CER 在后）
 - 起始轮只跑 `>=` 该 level 的步骤，之后每轮都从 `clone` 完整跑；`round < START_ROUND` 的轮次整个跳过
 - **续跑模式**（`START_ROUND>1` 或 `START_STEP!=clone`）：跳过 ASR + 预算分配，复用已有 `allocation/speaker_duration_stats_post_prune_resume.csv` + `original_clones_needed.json`（缺失则报错退出）
 - 复用来源：磁盘已有 clone（`03_tts_clone.py` 跳过已存在文件）、已有 `.cer.json`/`.sim.json`（评估 `--skip-existing`）
-- 每轮的磁盘 SCAN、剪枝、统计始终执行（不受 `START_STEP` 影响），保证基线与汇总正确
-- 例：`START_ROUND=1 START_STEP=cer bash 05_iterative_pipeline.sh`（第1轮从 CER 开始）；`START_ROUND=3 bash ...`（从第3轮克隆开始）
+- 每轮的磁盘 SCAN、统计始终执行（不受 `START_STEP` 影响），保证基线与汇总正确
+- 例：`START_ROUND=1 START_STEP=sim bash 05_iterative_pipeline.sh`（第1轮从 SIM 开始，克隆已完成）；`START_ROUND=3 bash ...`（从第3轮克隆开始）
 
 ### `00_prepare_stats.py` 细节
 
@@ -389,7 +389,8 @@ tail -f clone_workdir/iterative_pipeline/pipeline_*.log
 - `CLONE_ROOT`：`.../audio_higgs_audio_v3_tts_clone_3`（`clone_workdir/` 与 `*.wav` 已在 `.gitignore`，不要提交）
 - `NUM_SERVERS=4`，`ALL_GPUS=0,1,2,3`，`WORKERS_PER_SERVER=16`，`TOTAL_ROUNDS=10`，`TOTAL_CLONE_HOURS=10000`
 - `MAX_CER=0.03`，`MIN_SIM=0.85`（剪枝阈值），`SEED=42`
-- CER 提速：`ASR_BATCH_SIZE=32`、`ASR_AUDIO_WORKERS=16`、`ASR_MAX_NEW_TOKENS=512`（透传给 `run_eval_cer.sh` 的 `--batch-size/--audio-workers/--asr-max-new-tokens`，并加 `--group-by-language`）
+- CER 提速：`ASR_BACKEND=vllm`（默认，vLLM 连续批处理、TP=卡数、GPU 利用率高；`transformers` 为回退）、`ASR_VLLM_BATCH=256`、`ASR_GPU_MEM_UTIL=0.9`、`ASR_AUDIO_WORKERS=16`、`ASR_MAX_NEW_TOKENS=512`、`ASR_BATCH_SIZE=32`（仅 transformers 用）。透传给 `run_eval_cer.sh` 的 `--asr-backend/--asr-gpu-mem-util/--batch-size/--audio-workers/--asr-max-new-tokens`。语言预分组：transformers 用 `--group-by-language`，**vllm 用 `--no-group-by-language`**（vllm 对混合语言不敏感，省掉全量 json 预扫）
+- **全盘扫描全部多进程（`SCAN_WORKERS=64`）**：`05_scan_existing_clones.py --workers`（重写为多进程，367k→~7s）、`eval_cer --scan-workers`（`list_clone_items` 改无-meta 并行扫，79s→~3s）、`prune_and_copy --scan-workers`（`scan_clone_wavs` 改按 speaker 分片，~0.5s）、`run_eval_sim.sh --scan-workers`（~20s，需读每条 json 取 ref）
 - `TTS_MAX_NEW_TOKENS=1024`（默认保持；即 `03_tts_clone.py --max-new-tokens`，SGLang audio-token 上限 ≈40.7s，长文本截断根因，需要时上调）
 - 日志：`clone_workdir/iterative_pipeline/pipeline_*.log`；各轮工件在 `round_NN/`
 
@@ -477,7 +478,10 @@ eval_higgs_audio/
 #### 流程
 1. 扫描 clone 目录 → 找到所有 `clone_NNNN.wav` + `clone_NNNN.json` 配对
 2. （可选）`--group-by-language`（默认开）：并行推断每条语言后按语言排序，使每个 batch 尽量单语言、跑满（避免 `transcribe_asr_batch` 内按语言拆子批变小）
-3. Qwen3-ASR 转写 wav（`--batch-size` 默认 512？否——脚本默认 16，**流水线用 32**；`--audio-workers` 默认 0，流水线用 16 做音频预取重叠；`--asr-max-new-tokens` 默认 **512**，原 256 会截断长音频转写；24 kHz → 16 kHz 内部重采样）
+3. Qwen3-ASR 转写 wav。**`--asr-backend`（默认 `transformers`，流水线用 `vllm`）**：
+   - `vllm`：`Qwen3ASRModel.LLM(tensor_parallel_size=len(asr_gpus), gpu_memory_utilization=--asr-gpu-mem-util)` 单引擎连续批处理，GPU 利用率高；`main()` 里在 CUDA 初始化前 `os.environ["CUDA_VISIBLE_DEVICES"]=--asr-gpus`；`--batch-size` 用较大值（流水线 `ASR_VLLM_BATCH=256`）。已验证与 transformers 转写逐条一致（CER 等价）。
+   - `transformers`：每 GPU 一个 HF 模型、`ThreadPoolExecutor(len(gpus))` 多线程驱动（受 GIL 限制 + `model.generate` 自回归 → 利用率低）；`--batch-size` 流水线用 32。
+   - 通用：`--audio-workers`（默认 0，流水线 16，音频预取重叠）；`--asr-max-new-tokens` 默认 **512**（原 256 截断长音频）；24 kHz → 16 kHz 内部重采样
 4. Manual ITN（对 ref 和 hypo 同时执行）
 5. `jiwer.process_characters()` 计算字符级 CER
 6. 结果写入 sidecar + JSONL

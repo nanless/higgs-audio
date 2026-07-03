@@ -272,22 +272,22 @@ def _scan_dataset_wavs(root: str) -> list[str]:
     return wavs
 
 
-def scan_clone_wavs(out_dir: Path, workers: int = 16) -> list[str]:
-    """Scan clone root for existing clone_*.wav files (parallel by dataset)."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+def scan_clone_wavs(out_dir: Path, workers: int = 32) -> list[str]:
+    """Scan clone root for existing clone_*.wav files (parallel over speaker dirs)."""
+    from concurrent.futures import ProcessPoolExecutor
 
-    subdirs = [str(p) for p in out_dir.iterdir() if p.is_dir() and p.name not in SKIP_DIR_NAMES]
+    out_dir = Path(out_dir)
+    subdirs = _list_speaker_dirs(out_dir)  # dataset/speaker level -> better balanced parallelism
     t0 = time.time()
     wavs: list[str] = []
     if len(subdirs) > 1 and workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(_scan_dataset_wavs, sd) for sd in subdirs]
-            for fut in as_completed(futs):
-                wavs.extend(fut.result())
+        with ProcessPoolExecutor(max_workers=min(workers, len(subdirs))) as ex:
+            for batch in ex.map(_scan_dataset_wavs, subdirs, chunksize=16):
+                wavs.extend(batch)
     else:
         for sd in subdirs:
             wavs.extend(_scan_dataset_wavs(sd))
-    print(f"[scan] {len(wavs):,} clone wavs on disk in {time.time() - t0:.1f}s", file=sys.stderr)
+    print(f"[scan] {len(wavs):,} clone wavs on disk in {time.time() - t0:.1f}s ({workers}p)", file=sys.stderr)
     return wavs
 
 
