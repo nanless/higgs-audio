@@ -630,6 +630,9 @@ def main():
     parser.add_argument("--max-clones-per-speaker", type=int, default=None)
     parser.add_argument("--estimate-clone-duration", type=float, default=10.0)
     parser.add_argument(
+        "--target-sec", type=float, default=3600.0, help="per-speaker target seconds (non post-prune path)"
+    )
+    parser.add_argument(
         "--post-prune",
         action="store_true",
         help="Use post-prune stats CSV (combined duration + precomputed clones_needed/start_clone_idx)",
@@ -717,12 +720,12 @@ def main():
                 continue
 
             dur = float(r["total_duration_sec"])
-            if dur < 3600:
+            if dur < args.target_sec:
                 all_low += 1
                 if num_files < 20:
                     filtered_out += 1
                     continue
-                gap = 3600 - dur
+                gap = args.target_sec - dur
                 clones_net = int(gap / args.estimate_clone_duration) + 1
                 clones_total = int(clones_net / args.quality_pass_rate) + 1
                 tasks.append(

@@ -91,7 +91,7 @@ def _scan_speaker_clone_dir(clone_dir: str) -> tuple[float, int, int]:
     return total, count, max_idx + 1
 
 
-def _process_row(row: dict, clone_root: str) -> dict | None:
+def _process_row(row: dict, clone_root: str, target_sec: float = TARGET_DURATION_SEC) -> dict | None:
     num_files = int(row["num_files"])
     if num_files < MIN_SOURCE_FILES:
         return None
@@ -102,7 +102,7 @@ def _process_row(row: dict, clone_root: str) -> dict | None:
     clone_dir = os.path.join(clone_root, dataset, speaker_id)
     clone_dur, clone_count, start_idx = _scan_speaker_clone_dir(clone_dir)
     combined = source_dur + clone_dur
-    gap = max(0.0, TARGET_DURATION_SEC - combined)
+    gap = max(0.0, target_sec - combined)
 
     base = {
         "dataset": dataset,
@@ -159,7 +159,14 @@ def main():
         default=DEFAULT_TOTAL_CLONE_HOURS,
         help="Total clone generation hours to allocate across NEED_CLONE speakers by gap",
     )
+    parser.add_argument(
+        "--target-duration-sec",
+        type=float,
+        default=TARGET_DURATION_SEC,
+        help="Per-speaker target duration in seconds (default 3600)",
+    )
     args = parser.parse_args()
+    target_sec = args.target_duration_sec
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(args.stats_csv, newline="") as f:
@@ -169,7 +176,7 @@ def main():
     t0 = time.time()
     results: list[dict] = []
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(_process_row, row, args.clone_root) for row in rows]
+        futs = [ex.submit(_process_row, row, args.clone_root, target_sec) for row in rows]
         for fut in as_completed(futs):
             r = fut.result()
             if r is not None:
@@ -198,7 +205,7 @@ def main():
         writer.writerows(need)
 
     summary = {
-        "target_duration_sec": TARGET_DURATION_SEC,
+        "target_duration_sec": target_sec,
         "min_source_files": MIN_SOURCE_FILES,
         "total_clone_hours_budget": args.total_clone_hours,
         "allocation": "gap_proportional",
@@ -237,7 +244,7 @@ def main():
     lines = [
         "Post-Prune Speaker Duration Re-evaluation",
         "=" * 72,
-        f"Per-speaker target: {TARGET_DURATION_SEC:.0f}s (source + kept clones)",
+        f"Per-speaker target: {target_sec:.0f}s (source + kept clones)",
         f"Clone budget: {args.total_clone_hours:,.0f} hours (allocated by gap proportion)",
         f"Avg clone duration for sizing: {args.estimate_clone_duration:.0f}s",
         f"Elapsed: {elapsed:.1f}s",

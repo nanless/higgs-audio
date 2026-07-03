@@ -131,12 +131,15 @@ class SpeakerEncoder:
 
     @staticmethod
     def cosine_similarity(e1, e2) -> float:
+        # RAW cosine similarity in [-1, 1]. NOTE: this intentionally does NOT apply the
+        # wespeaker-CLI (cos+1)/2 [0,1] mapping. Similarity written to .sim.json and used
+        # for pruning is the raw cosine. (mapped can be recovered as (raw+1)/2.)
         if isinstance(e1, torch.Tensor):
             e1 = e1.detach().cpu()
         if isinstance(e2, torch.Tensor):
             e2 = e2.detach().cpu()
         score = torch.dot(e1, e2) / (torch.norm(e1) * torch.norm(e2))
-        return float((score.item() + 1.0) / 2.0)
+        return float(score.item())
 
     def compute_similarity(self, audio_path1: Union[str, Path], audio_path2: Union[str, Path]) -> Optional[float]:
         e1 = self.extract_embedding(audio_path1)

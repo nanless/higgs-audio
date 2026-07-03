@@ -215,5 +215,8 @@ cer_bad_samples_top100_20260614_191916
 
 eval_higgs_audio/eval_distribution_report.json
 eval_higgs_audio/eval_distribution_report.txt
+eval_higgs_audio/sim_dist_report/
 
 eval_higgs_audio/logs
+sampled_pairs/
+eval_higgs_audio/prune_prev_report/

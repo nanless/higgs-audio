@@ -3,13 +3,14 @@
 # Each worker loads its own model instance and processes 1/N of speakers.
 #
 # Usage (positional args):
-#     bash 02_asr_launch.sh [GPUS] [STATS_CSV]
-#     e.g. bash 02_asr_launch.sh "0,1,2,3,4,5,6,7" ./clone_workdir/speaker_duration_stats.csv
+#     bash 02_asr_launch.sh [GPUS] [STATS_CSV] [TARGET_SEC]
+#     e.g. bash 02_asr_launch.sh "0,1,2,3,4,5,6,7" ./clone_workdir/speaker_duration_stats.csv 1800
 
 set -euo pipefail
 
 GPUS="${1:-0,1}"
 STATS_CSV="${2:-./clone_workdir/speaker_duration_stats.csv}"
+TARGET_SEC="${3:-3600}"
 LOCAL_MODEL="/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local"
 FILES_PER_BATCH=48
 CONDA_PYTHON="/root/miniforge3/envs/qwen3-asr/bin/python3"
@@ -56,7 +57,8 @@ for GPU_ID in "${GPU_ARR[@]}"; do
             --gpu-id "$GPU_ID" \
             --total-gpus "$TOTAL_GPUS" \
             --local-model "$LOCAL_MODEL" \
-            --files-per-batch "$FILES_PER_BATCH" &
+            --files-per-batch "$FILES_PER_BATCH" \
+            --target-sec "$TARGET_SEC" &
     PIDS+=($!)
 done
 

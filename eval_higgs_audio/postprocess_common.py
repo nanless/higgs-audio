@@ -38,7 +38,7 @@ CLONE_SIDECAR_SUFFIXES = [".json", ".eval.json", ".cer.json", ".sim.json", ".mos
 SIDECAR_RENAME = {".eval.json": ".cer.json"}
 
 DEFAULT_MAX_CER = 0.03
-DEFAULT_MIN_SIM = 0.85
+DEFAULT_MIN_SIM = 0.8  # raw cosine (encoder now returns raw cos, not (cos+1)/2)
 
 PRUNE_RULES_TEXT = f"DELETE: CER > {DEFAULT_MAX_CER} OR SIM < {DEFAULT_MIN_SIM}; KEEP: otherwise"
 

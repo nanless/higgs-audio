@@ -126,8 +126,10 @@ def main():
     p.add_argument("--clone-dirs", nargs="+", default=[], help="复刻音频目录 (时长计入, speaker_path 不取自此)")
     p.add_argument("--output-dir", default=None, help="输出目录")
     p.add_argument("--workers", type=int, default=None)
+    p.add_argument("--target-sec", type=float, default=TARGET_SEC, help="每个说话人目标时长(秒), 默认 3600")
     a = p.parse_args()
     workers = a.workers or min(cpu_count(), 32)
+    target = a.target_sec
     t0 = time.time()
 
     # ---- 收集说话人 ----
@@ -205,8 +207,8 @@ def main():
     gap_total = 0.0
     for (dataset, spk_id), info in sorted(stats.items()):
         dur = info["total_sec"]
-        gap = max(0.0, TARGET_SEC - dur)
-        if dur >= TARGET_SEC:
+        gap = max(0.0, target - dur)
+        if dur >= target:
             ok += 1
         elif info["num_files"] >= 20:
             need += 1
@@ -227,7 +229,7 @@ def main():
                 "clone_duration_sec": round(info["clone_sec"], 2),
                 "total_duration_sec": round(info["total_sec"], 2),
                 "gap_sec": round(gap, 2),
-                "status": "OK" if dur >= TARGET_SEC else ("NEED" if info["num_files"] >= 20 else "LOW"),
+                "status": "OK" if dur >= target else ("NEED" if info["num_files"] >= 20 else "LOW"),
                 "speaker_path": info["spk_path"],
             }
         )

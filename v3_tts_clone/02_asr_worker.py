@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--total-gpus", type=int, required=True)
     parser.add_argument("--local-model", default="/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local")
     parser.add_argument("--files-per-batch", type=int, default=48)
+    parser.add_argument("--target-sec", type=float, default=3600.0, help="只转写 total_duration_sec < target 的说话人")
     args = parser.parse_args()
 
     gpu_id = args.gpu_id
@@ -74,7 +75,7 @@ def main():
     all_speakers = []
     with open(args.stats_csv) as f:
         for i, r in enumerate(csv.DictReader(f)):
-            if float(r["total_duration_sec"]) < 3600 and i % total_gpus == gpu_id:
+            if float(r["total_duration_sec"]) < args.target_sec and i % total_gpus == gpu_id:
                 all_speakers.append(
                     {
                         "dataset": r["dataset"],

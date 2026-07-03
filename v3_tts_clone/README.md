@@ -119,6 +119,17 @@ Step 2 × 10:
 | `speaker_path` 覆盖为 SOURCE_DIRS | 参考音频只用原始音频 |
 | `--refresh-scan` for CER | 防止剪枝后 pickle 缓存失效 |
 | 剪枝/验证读 per-clone sidecar (`--eval-source sidecar`, 多进程) | 聚合 jsonl「首条胜出」去重会用旧记录, 复用编号时误判; sidecar 剪枝删、重评重建, 永远新鲜 |
+| SIM = **raw 余弦** (阈值 0.8) | `speaker_encoder` 已去掉 `(cos+1)/2` 映射; `MIN_SIM=0.8` 是 raw 口径 (旧 0.85 mapped = raw 0.70) |
+| 目标时长可配 `TARGET_SEC` | 生产用 1800 (半小时); 传给 `00/04/02` |
+| 统计只算源音频 | 重跑 `00_prepare_stats.py --source-dirs {audio} --target-sec 1800`(**不带 `--clone-dirs`**), 新 CLONE_ROOT 从 0 |
+
+## 老 clone 目录筛选 (`eval_higgs_audio/prune_prev_clones.py`)
+
+把以前的 clone 目录 (omnivoice/_1/_2/_3) 按**新质量线** (raw<0.8 或 cer>0.03) 筛一遍。读缓存 `.sim.json`(mapped)→`raw=2·sim-1`、`.cer.json`，**GPU-free、无需参考文件**（`_2` 参考已删也能筛）。默认 dry-run：
+```bash
+python eval_higgs_audio/prune_prev_clones.py --dirs /…/audio_omnivoice_clone /…/_clone /…/_clone_2 /…/_clone_3   # 预览
+python eval_higgs_audio/prune_prev_clones.py --dirs … --execute                                                  # 真删
+```
 
 ## 评估提速 (CER)
 

@@ -57,7 +57,8 @@ WORKERS_PER_SERVER="${WORKERS_PER_SERVER:-16}"
 ESTIMATE_CLONE_DURATION="${ESTIMATE_CLONE_DURATION:-10}"
 QUALITY_PASS_RATE="${QUALITY_PASS_RATE:-0.5}"
 MAX_CER="${MAX_CER:-0.03}"
-MIN_SIM="${MIN_SIM:-0.85}"
+MIN_SIM="${MIN_SIM:-0.8}"        # raw 余弦阈值 (编码器已改为 raw cos)
+TARGET_SEC="${TARGET_SEC:-3600}"  # 每说话人目标时长(秒); 本次生产用 1800 (半小时)
 ALL_GPUS="${ALL_GPUS:-0,1,2,3}"
 ASR_BACKEND="${ASR_BACKEND:-vllm}"          # vllm (连续批处理, 高 GPU 利用率) | transformers
 ASR_BATCH_SIZE="${ASR_BATCH_SIZE:-32}"       # transformers 后端每卡 batch
@@ -243,7 +244,7 @@ else
             source /root/anaconda3/etc/profile.d/conda.sh
         fi
     fi
-    bash "${V3_CLONE_DIR}/02_asr_launch.sh" "${ALL_GPUS}" "${STATS_CSV}"
+    bash "${V3_CLONE_DIR}/02_asr_launch.sh" "${ALL_GPUS}" "${STATS_CSV}" "${TARGET_SEC}"
     echo "  ✅ ASR 转写完成"
 
     # 释放 GPU 显存: 杀掉 ASR worker 进程, 防止影响后续 TTS
@@ -369,6 +370,7 @@ run_or_fail "04_post_prune_stats" \
         --clone-root ${CLONE_ROOT} \
         --output-dir ${ALLOC_DIR} \
         --total-clone-hours ${TOTAL_CLONE_HOURS} \
+        --target-duration-sec ${TARGET_SEC} \
         --estimate-clone-duration ${ESTIMATE_CLONE_DURATION}"
 
 if [ ! -f "${FULL_RESUME_CSV}" ]; then
@@ -610,10 +612,12 @@ python ${V3_CLONE_DIR}/04_post_prune_stats.py \
     --clone-root ${CLONE_ROOT} \
     --output-dir ${PIPELINE_WORKDIR}/final \
     --total-clone-hours ${TOTAL_CLONE_HOURS} \
+    --target-duration-sec ${TARGET_SEC} \
     --estimate-clone-duration ${ESTIMATE_CLONE_DURATION}
 
 log_step "FINAL" "最终质量验证"
 python ${EVAL_DIR}/verify_kept_clones.py --out-dir ${CLONE_ROOT} \
+    --min-sim ${MIN_SIM} --max-cer ${MAX_CER} \
     --eval-source sidecar --eval-workers ${PRUNE_WORKERS} || true
 
 # 汇总各轮统计
