@@ -34,7 +34,9 @@ from postprocess_common import (
     DEFAULT_MIN_SIM,
     classify,
     load_cer_data,
+    load_cer_map_sidecars,
     load_sim_data,
+    load_sim_map_sidecars,
     scan_clone_wavs,
 )
 
@@ -102,7 +104,18 @@ def _delete_parallel(delete_list: list[str], workers: int, dry: bool) -> tuple[i
     return ok, fail
 
 
-def _build_maps(out_dir: Path) -> tuple[dict[str, float | None], dict[str, float | None]]:
+def _build_maps(
+    out_dir: Path, source: str = "sidecar", workers: int = 32
+) -> tuple[dict[str, float | None], dict[str, float | None]]:
+    """Build {wav: cer} and {wav: sim} maps.
+
+    source="sidecar" (default): read per-clone .cer.json/.sim.json (authoritative, always
+    fresh even after prune+regenerate). source="jsonl": legacy aggregate JSONL loaders.
+    """
+    if source == "sidecar":
+        cer_map = load_cer_map_sidecars(out_dir, workers=workers)
+        sim_map = load_sim_map_sidecars(out_dir, workers=workers)
+        return cer_map, sim_map
     cer_records = load_cer_data(out_dir)
     sim_records = load_sim_data(out_dir)
     cer_map = {r["wav"]: r.get("manual_cer") for r in cer_records}
@@ -154,6 +167,13 @@ def main():
     )
     parser.add_argument("--workers", type=int, default=32, help="Parallel delete workers")
     parser.add_argument("--scan-workers", type=int, default=16, help="Parallel scan workers")
+    parser.add_argument(
+        "--eval-source",
+        choices=("sidecar", "jsonl"),
+        default="sidecar",
+        help="sidecar=read per-clone .cer.json/.sim.json (authoritative, fresh); jsonl=aggregate details",
+    )
+    parser.add_argument("--eval-workers", type=int, default=32, help="Parallel workers for reading eval sidecars")
     parser.add_argument("--log", type=Path, default=None)
     args = parser.parse_args()
 
@@ -163,7 +183,7 @@ def main():
 
     rules = f"DELETE: CER > {args.max_cer} OR SIM < {args.min_sim}; KEEP: otherwise"
     t0 = time.time()
-    cer_map, sim_map = _build_maps(args.out_dir)
+    cer_map, sim_map = _build_maps(args.out_dir, source=args.eval_source, workers=args.eval_workers)
     if not cer_map and not sim_map:
         print("ERROR: no CER/SIM records found", file=sys.stderr)
         sys.exit(1)

@@ -1,228 +1,149 @@
-# Higgs Audio v3 TTS 声音复刻流水线
+# Higgs Audio v3 — 迭代克隆流水线
 
-将总时长不足 1 小时（3600s）且音频 ≥20 条的说话人复刻到 1 小时水平。
+## 概述
 
-## 流水线
+一键运行：ASR 转写 → 预算分配 → 10 轮迭代（每轮：启动 TTS → 克隆 1/10 → 停止 TTS → CER → SIM → 剪枝）。
+
+## 脚本
 
 ```
-Step 1 → speaker_duration_stats.csv
-Step 2 → ASR 转写所有 <1h 说话人的全部音频 (1,045,442 文件)
-Step 3 → SGLang-Omni 本地部署 TTS 声音复刻
+00_prepare_stats.py            生成全量说话人统计 (手动运行一次)
+02_asr_launch.sh / 02_asr_worker.py  ASR 转写 (被 05 调用)
+03_launch_servers.sh           SGLang TTS 启动 (被 05 调用, 每轮启停)
+03_tts_clone.py                TTS 克隆 (被 05 调用)
+04_post_prune_stats.py         预算分配 (被 05 调用)
+05_scan_existing_clones.py     扫描已有 clone 数
+05_generate_round_csv.py       每轮生成受限 CSV
+05_save_orig_allocation.py     保存分配基准
+05_iterative_pipeline.sh       主流水线 (包含 ASR + TTS + 10 轮迭代)
+05_iterative_pipeline.env      配置
 ```
 
-## 环境
+---
 
-| Step | 环境 | 说明 |
-|------|------|------|
-| Step 1 | 系统 Python | `pip install librosa soundfile` |
-| Step 2 | `qwen3-asr` conda env | Qwen3-ASR 1.7B + transformers 4.57.6 |
-| Step 3 服务端 | `higgs_v3_env` conda env | SGLang-Omni，每 GPU 一个进程 |
-| Step 3 客户端 | 系统 Python | 仅需 requests、soundfile、numpy |
+## 准备
 
-## 被排除的数据集
-
-`childmandarin`, `child207m-korean-filtered`, `chineseenglishchildren`, `king-asr-725`, `kingasr612`, `speechocean762`
-
-## Step 1: 说话人时长统计
+### 1. 生成统计 (只跑一次)
 
 ```bash
-python v3_tts_clone/01_stats_speakers.py \
-    --audio-root /root/group-shared/.../audio \
-    --output-dir ./clone_workdir \
-    --workers 8
+python3 v3_tts_clone/00_prepare_stats.py \
+    --source-dirs /root/group-shared/.../audio \
+    --clone-dirs \
+        /root/group-shared/.../audio_higgs_audio_v3_tts_clone \
+        /root/group-shared/.../audio_higgs_audio_v3_tts_clone_2 \
+        /root/group-shared/.../audio_omnivoice_clone \
+    --output-dir clone_workdir/stats_output \
+    --workers 32
 ```
 
-→ `clone_workdir/speaker_duration_stats.csv`
+- `--source-dirs`：原始音频。`speaker_path` 取自此。
+- `--clone-dirs`：复刻音频。时长计入 `clone_duration_sec`，不用于 `speaker_path`。
+- **输出文件名固定为 `{output-dir}/all_speakers.csv`**。下一步的 `STATS_CSV` 必须指向该文件（示例里的 `speaker_duration_stats_v2.csv` 是重命名后的路径——按需改名，或直接把 `STATS_CSV` 指向 `all_speakers.csv`）。
 
-## Step 2: 批量 ASR 转写
+### 2. 编辑配置
+
+`v3_tts_clone/05_iterative_pipeline.env`：
 
 ```bash
-bash v3_tts_clone/02_asr_launch.sh "0,1"
+REPO="/root/code/github_repos/higgs-audio"
+BASE="/root/group-shared/..."
+
+# STATS_CSV = 上一步 00 生成的 all_speakers.csv (或其重命名)
+export STATS_CSV="${REPO}/clone_workdir/speaker_duration_stats_v2.csv"
+# TEXTS_JSONL = 克隆用的文本池 (每行一条 JSON, 含 text/clean_text)
+export TEXTS_JSONL="${REPO}/higgs_audio_v3_text_generator/batch_output_v2/generated_texts_final.jsonl"
+export SOURCE_DIRS="${BASE}/audio"
+export CLONE_ROOT="${BASE}/audio_higgs_audio_v3_tts_clone_3"
+export TOTAL_CLONE_HOURS=10000
+export TOTAL_ROUNDS=10
+export NUM_SERVERS=4
+export ALL_GPUS="0,1,2,3"
+# 评估提速 / 长度控制
+export ASR_BATCH_SIZE=32
+export ASR_AUDIO_WORKERS=16
+export ASR_MAX_NEW_TOKENS=512
+export TTS_MAX_NEW_TOKENS=1024   # ↑ 提高可让长文本完整发声(更耗算力), 详见下文
 ```
 
-→ `{音频路径}.json` （与音频同目录，含 transcript、language）
-
-## Step 3: TTS 声音复刻
-
-当前生产配置：
-
-- 8 个 SGLang-Omni 服务：GPU `0-7` → 端口 `8000-8007`
-- 客户端并发：`--workers-per-server 16`（总并发约 128）
-- 文本选择：不按 dataset 或 speaker 语言过滤；所有说话人都从完整文本池随机抽样
-- 请求模式：非流式 `/v1/audio/speech`，每条音频完整返回后写入 `clone_XXXX.wav`
-- 后台运行：使用 `tmux` session `higgs_step3`
-
-### SGLang-Omni 安装
-
-`sgl-omni` 入口来自 `/root/code/github_repos/sglang-omni` 的 editable 安装：
+### 3. 运行
 
 ```bash
-/root/code/github_repos/higgs-audio/higgs_v3_env/bin/python3 \
-    -m pip install -e /root/code/github_repos/sglang-omni --no-deps
+source v3_tts_clone/05_iterative_pipeline.env
+tmux new-session -d -s higgs "bash v3_tts_clone/05_iterative_pipeline.sh"
 ```
 
-不建议让 pip 重新解析依赖；当前环境依赖已固定，`--no-deps` 用于避免升级 torch/transformers 等大包。
+查看：`tmux attach -t higgs` 或 `tail -f clone_workdir/iterative_pipeline/pipeline_*.log`
 
-### 手动运行
+---
 
-终端 1 — 启动 SGLang 服务（一直跑着）：
+## 内部流程
 
-```bash
-bash v3_tts_clone/03_launch_servers.sh "0,1,2,3,4,5,6,7" /root/models/higgs-audio-v3-tts-4b 8000
+```
+Step 0   检查 STATS_CSV, 合并参考音频目录
+Step 0.5a ASR 转写源音频 → 释放 GPU
+Step 1a   扫描 CLONE_ROOT 预存 clone
+Step 1b   预算分配 (04_post_prune_stats.py)
+Step 1c   保存分配基准 (05_save_orig_allocation.py)
+
+Step 2 × 10:
+  ├ 启动 TTS → 健康检查
+  ├ 扫描已有 clone (05_scan_existing_clones.py)
+  ├ 生成本轮 CSV (05_generate_round_csv.py): per_round = ceil(原始/10)
+  ├ 克隆 (03_tts_clone.py --post-prune)
+  ├ 停止 TTS → 释放 GPU
+  ├ CER 评估 (--skip-existing --refresh-scan, batch/audio-workers/语言分组) → pkill eval_cer.py 释放 GPU
+  ├ SIM 评估 (--skip-existing) → pkill eval_sim.py 释放 GPU
+  ├ 剪枝 (读 per-clone sidecar, CER>0.03 或 SIM<0.85)
+  └ 统计 (归档本轮 existing_clones_after.json)
+
+最终  04 最终统计 + verify_kept_clones.py 质量验证 + 各轮汇总
 ```
 
-终端 2 — 运行克隆客户端（可 Ctrl+C 中断，重跑续传）：
+> Step 1a 仅扫描 `CLONE_ROOT` 用于日志展示；`04` 会自己扫描 `--clone-root` 计入 clone 时长，两者不叠加。
 
-```bash
-python v3_tts_clone/03_tts_clone.py \
-    --stats-csv ./clone_workdir/speaker_duration_stats.csv \
-    --texts-jsonl higgs_audio_v3_text_generator/batch_output_v2/generated_texts_final.jsonl \
-    --output-root /root/group-shared/.../audio_higgs_audio_v3_tts_clone \
-    --base-port 8000 \
-    --num-servers 8 \
-    --workers-per-server 16
-```
+---
 
-首次测试可用 `--max-speakers 5 --max-clones-per-speaker 1` 限制范围。
+## 关键设计
 
-文本选择不按 dataset 或 speaker 的语言做偏好过滤；每个说话人都从完整文本池随机抽样，可混合中文、英文和中英混合文本。
-
-### tmux 后台生产
-
-当前生产使用 `tmux`，退出 Cursor 或断开终端后任务仍会继续：
-
-```bash
-tmux attach -t higgs_step3
-```
-
-窗口约定：
-
-| Window | 用途 |
-|--------|------|
-| `servers` | 8 个 SGLang-Omni 服务 |
-| `client` | 全量复刻客户端 |
-| `progress` | 每分钟写进度 |
-
-常用日志：
-
-| 文件 | 说明 |
+| 设计 | 原因 |
 |------|------|
-| `clone_workdir/step3_tmux_servers.log` | 服务端启动与运行日志 |
-| `clone_workdir/step3_tmux_client.log` | 客户端运行日志 |
-| `clone_workdir/step3_progress_tmux.log` | 每分钟进度统计 |
+| 每轮启停 TTS | 克隆后释放 GPU 给 CER/SIM 评估 |
+| ASR 后释放 GPU | `pkill asr_worker` 防止抢占 TTS 显存 |
+| 预算只分配一次 | 避免每轮重新分配导致漂移 |
+| `ceil/10` + `still_need` 防超量 | 原始 5 条第 6 轮自动停止 |
+| 磁盘扫描替代内存 tracker | 自动反映剪枝删除和 API 失败 |
+| 每轮 seed 不同 (`SEED + round*1000000`) | 尾部剪枝编号被复用时文本/参考仍不同; 同轮内确定, 可续跑 |
+| `speaker_path` 覆盖为 SOURCE_DIRS | 参考音频只用原始音频 |
+| `--refresh-scan` for CER | 防止剪枝后 pickle 缓存失效 |
+| 剪枝/验证读 per-clone sidecar (`--eval-source sidecar`, 多进程) | 聚合 jsonl「首条胜出」去重会用旧记录, 复用编号时误判; sidecar 剪枝删、重评重建, 永远新鲜 |
 
-查看进度：
+## 评估提速 (CER)
 
-```bash
-tail -f clone_workdir/step3_progress_tmux.log
-```
+- `ASR_BATCH_SIZE=32`（A800 80GB 充裕, 原 16 欠载）、`ASR_AUDIO_WORKERS=16`（音频解码并行, 与 GPU 重叠）、语言预分组（`--group-by-language`, 让每个 batch 尽量单语言、跑满）、`ASR_MAX_NEW_TOKENS=512`（原 256 会截断长音频转写）。
 
-进度行示例：
+## ⚠️ 长文本被截断 → 过度剪枝 (排查结论)
 
-```text
-2026-06-13T18:05:52 clone_wav=1179 clone_json=1180 ref_wav=128 speakers_with_clones=128
-```
+TTS 音频受 `TTS_MAX_NEW_TOKENS`（SGLang audio-token 上限）限制: **1024 tokens ≈ 40.7s @ 25fps**。约 **31.7%** 的 clone 命中该上限, 长文本(>~250字)音频被从中间截断 → ASR 只听到前半 → CER 虚高(300+字桶删除率 25.6%) → 长clone被过度剪枝。默认保持 `1024`；需要长文本完整发声时上调 `TTS_MAX_NEW_TOKENS`（如 2048/3072, 每条长clone更耗算力）。此为 `03_tts_clone.py --max-new-tokens`。
 
-其中 `clone_wav` / `clone_json` 是已生成音频和元数据数量，`speakers_with_clones` 是已有 clone 输出的说话人数。
+---
 
-### 重跑与断点续跑
+## 续跑
 
-客户端会跳过已存在且有效的 `clone_XXXX.wav` + `clone_XXXX.json`，因此同一输出目录可断点续跑。
+**A. 无脑重跑（断点续跑）**：直接重跑整条流水线。每轮克隆前跳过已有文件，ASR 已有 `.json` sidecar 的也跳过，天然幂等。
 
-如果需要**完全重跑**，先把旧输出目录移动到备份目录，再用空的 `audio_higgs_audio_v3_tts_clone/` 启动客户端；不要直接删除旧结果，便于回滚和抽查。
-
-## 输出目录结构
-
-```
-audio_higgs_audio_v3_tts_clone/
-└── {dataset}/
-    └── {speaker_id}/
-        ├── ref/
-        │   ├── ref_pool.json          # 候选池配置 + 全部候选元数据
-        │   └── ref_{hash}.wav         # 按需物化的参考（random 模式多条）
-        ├── clone_0000.wav             # 克隆音频
-        ├── clone_0000.json            # 含本条实际 ref_audio_path
-        └── ...
-```
-
-每条 clone 的 `clone_XXXX.json` 记录**当次使用的** `ref_audio_path`（指向 `ref/ref_{hash}.wav`），不再写统一的 `ref_audio.wav`。
-
-## JSON 元数据
-
-### 参考候选池 (`ref/ref_pool.json`)
-
-```json
-{"uid": "...", "ref_mode": "random", "ref_pool_size": 256,
- "candidates": [{"type": "concat", "duration_sec": 8.3, "source_files": [...]}]}
-```
-
-### 克隆音频 (`clone_NNNN.json`)
-```json
-{"clone_idx": 0, "uid": "...", "text": "...", "clean_text": "...",
- "ref_audio_path": ".../ref/ref_{hash}.wav", "ref_audio_type": "concat",
- "ref_transcript": "...", "ref_mode": "random", "audio_format": "wav"}
-```
-
-## Step 4: 质量过滤后重新评估时长
-
-质量过滤（CER/SIM prune）后，用 **源音频时长 + 保留 clone 时长** 重新统计，找出仍不足 1h 的说话人：
+**B. 从指定轮/指定步开始**（复用前面已跑出的结果）：用 `START_ROUND` + `START_STEP` 控制。
 
 ```bash
-python v3_tts_clone/04_post_prune_stats.py \
-    --stats-csv ./clone_workdir/speaker_duration_stats.csv \
-    --clone-root /root/group-shared/.../audio_higgs_audio_v3_tts_clone \
-    --output-dir ./clone_workdir \
-    --total-clone-hours 10000
+# 第 1 轮从 CER 评估开始 (复用已生成的 clone)
+START_ROUND=1 START_STEP=cer bash v3_tts_clone/05_iterative_pipeline.sh
+
+# 直接从第 3 轮的克隆开始
+START_ROUND=3 bash v3_tts_clone/05_iterative_pipeline.sh
+
+# 第 3 轮从 SIM 评估开始
+START_ROUND=3 START_STEP=sim bash v3_tts_clone/05_iterative_pipeline.sh
 ```
 
-输出：
-
-| 文件 | 说明 |
-|------|------|
-| `speaker_duration_stats_post_prune.csv` | 全部说话人（含 OK / NEED_CLONE） |
-| `speaker_duration_stats_post_prune_resume.csv` | 仅 NEED_CLONE，供 Step 3 续跑 |
-| `post_prune_stats_summary.json` / `.txt` | 汇总报告 |
-
-**分配策略**：在 NEED_CLONE 说话人之间，按各自 `gap_sec`（距 3600s 的缺口）占比，分配 `--total-clone-hours`（默认 **10000** 小时）的生成预算。每人 `clones_needed = max(1, int(allocated_sec / estimate_clone_duration) + 1)`，不再按「每人补满 1h + quality_pass_rate buffer」估算。
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--total-clone-hours` | `10000` | 全局 clone 生成小时预算（按缺口比例分配） |
-| `--estimate-clone-duration` | `10` | 估算每条 clone 秒数，用于换算条数 |
-
-### Step 3 续跑（post-prune）
-
-```bash
-python v3_tts_clone/03_tts_clone.py \
-    --stats-csv ./clone_workdir/speaker_duration_stats_post_prune_resume.csv \
-    --post-prune \
-    --texts-jsonl higgs_audio_v3_text_generator/batch_output_v2/generated_texts_final.jsonl \
-    --output-root /root/group-shared/.../audio_higgs_audio_v3_tts_clone \
-    --base-port 8000 --num-servers 8 --workers-per-server 16
-```
-
-续跑会从已有 `clone_XXXX` 最大编号 +1 开始生成，不会覆盖已保留的 clone。
-
-### 参考/文本随机性（`03_tts_clone.py`）
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--ref-mode` | `random` | `fixed` 每人固定一条 ref；`rotate` 每 N 条换 ref；`random` 每条 clone 独立 ref |
-| `--ref-rotate-every` | `50` | `rotate` 模式下每 N 条 clone 换一次参考 |
-| `--ref-pool-size` | `256` | 每说话人从合法单条/拼接组合中最多采样 256 个候选 ref |
-| `--seed` | `42` | 全局 seed（ref 与文本选取可复现、可断点续跑） |
-
-- **拼接参考**：在合法 7–20s 组合中随机/穷举采样，不再只取第一个命中组合  
-- **文本**：每条 clone 独立随机抽取（`pick_text(uid, clone_idx, seed)`），不再一次 shuffle 顺序取  
-
-## 参数速查
-
-| 参数 | 默认值 | 当前生产值 | 说明 |
-|------|--------|------------|------|
-| `--base-port` | 8000 | 8000 | SGLang 起始端口 |
-| `--num-servers` | 2 | 8 | SGLang 实例数（=GPU数）|
-| `--workers-per-server` | 16 | 16 | 每服务器并发线程数 |
-| `--total-clone-hours` | 10000 | 10000 | Step 4 全局 clone 预算（按缺口比例分配） |
-| `--estimate-clone-duration` | 10 | 10 | 平均每条克隆音频秒数 |
-| `--max-speakers` | None | None | 限制人数（测试用）|
-| `--max-clones-per-speaker` | None | None | 限制每个说话人生成条数（测试用）|
+- `START_STEP` 取值：`clone`(默认) < `cer` < `sim` < `prune`。起始轮只跑 `>=` 该步的部分，之后的轮次都从 `clone` 完整跑。
+- 一旦 `START_ROUND>1` 或 `START_STEP!=clone`，即进入**续跑模式**：跳过 ASR 转写与预算分配，复用已有的 `allocation/` 基准（`speaker_duration_stats_post_prune_resume.csv` + `original_clones_needed.json`）——若这两个文件缺失会直接报错，需先完整跑一次到分配完成。
+- 复用来源：磁盘已有 clone（`03_tts_clone.py` 跳过已存在文件）、已有 `.cer.json` / `.sim.json`（评估 `--skip-existing`）。

@@ -2,8 +2,9 @@
 # Launch Qwen3-ASR workers on all GPUs in parallel.
 # Each worker loads its own model instance and processes 1/N of speakers.
 #
-# Usage:
-#     bash 02_asr_launch.sh [--gpus "0,1,2,3,4,5,6,7"] [--stats-csv ./clone_workdir/speaker_duration_stats.csv]
+# Usage (positional args):
+#     bash 02_asr_launch.sh [GPUS] [STATS_CSV]
+#     e.g. bash 02_asr_launch.sh "0,1,2,3,4,5,6,7" ./clone_workdir/speaker_duration_stats.csv
 
 set -euo pipefail
 

@@ -184,6 +184,33 @@ def infer_asr_language_for_json(json_path: Path) -> str:
     return infer_asr_language(get_truth_text(json_path))
 
 
+def _lang_of_pair(pair: tuple) -> str:
+    try:
+        return infer_asr_language_for_json(pair[1])
+    except Exception:
+        return "Unknown"
+
+
+def sort_pairs_by_language(pairs: list, workers: int = 16) -> list:
+    """Sort (wav, json) pairs by inferred language so each fixed-size batch is (mostly)
+    single-language. This avoids transcribe_asr_batch splitting a batch into smaller
+    per-language sub-batches, keeping GPU batches full."""
+    if len(pairs) <= 1:
+        return pairs
+    t0 = time.time()
+    if workers > 1 and len(pairs) > 2000:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            langs = list(ex.map(_lang_of_pair, pairs, chunksize=256))
+    else:
+        langs = [_lang_of_pair(p) for p in pairs]
+    order = sorted(range(len(pairs)), key=lambda i: (langs[i], str(pairs[i][1])))
+    dist = defaultdict(int)
+    for lg in langs:
+        dist[lg] += 1
+    print(f"Language pre-grouping: {dict(dist)} in {time.time() - t0:.1f}s", flush=True)
+    return [pairs[i] for i in order]
+
+
 def get_cached_asr_text(asr_results: dict, wav_path: Path, language: str) -> str | None:
     entry = asr_results.get(str(wav_path))
     if entry is None:
@@ -863,7 +890,7 @@ def llm_itn_batch_fetch(batch: list[dict]) -> dict[str, dict]:
     return entries
 
 
-def load_asr_model(batch_size: int = 16, gpu_id: int = 0):
+def load_asr_model(batch_size: int = 16, gpu_id: int = 0, max_new_tokens: int = 512):
     print(f"Loading Qwen3-ASR model on GPU {gpu_id}...", flush=True)
     sys.path.insert(0, "/root/code/github_repos/Qwen3-ASR")
     from qwen_asr import Qwen3ASRModel
@@ -874,9 +901,9 @@ def load_asr_model(batch_size: int = 16, gpu_id: int = 0):
         dtype=torch.bfloat16,
         device_map=device,
         max_inference_batch_size=batch_size,
-        max_new_tokens=256,
+        max_new_tokens=max_new_tokens,
     )
-    print(f"ASR loaded (batch_size={batch_size}, gpu={gpu_id}).\n", flush=True)
+    print(f"ASR loaded (batch_size={batch_size}, gpu={gpu_id}, max_new_tokens={max_new_tokens}).\n", flush=True)
     return asr
 
 
@@ -1076,6 +1103,21 @@ def main():
     parser.add_argument("--skip-llm", action="store_true", help="Deprecated: LLM ITN is skipped by default")
     parser.add_argument("--enable-llm", action="store_true", help="Enable optional LLM ITN after manual ITN")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument(
+        "--asr-max-new-tokens",
+        type=int,
+        default=512,
+        help="ASR decode token cap (was 256, which clipped long clips; free for short ones since decode stops at EOS)",
+    )
+    parser.add_argument(
+        "--group-by-language",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sort clones by inferred language before batching so each ASR batch is single-language (fuller GPU batches)",
+    )
+    parser.add_argument(
+        "--lang-group-workers", type=int, default=16, help="Parallel workers for language pre-grouping"
+    )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--asr-gpus", type=str, default="0,1", help="Comma-separated GPU ids for ASR (default: 0,1)")
     parser.add_argument(
@@ -1156,6 +1198,9 @@ def main():
     if not pairs:
         print("No pairs to evaluate.", flush=True)
         return
+
+    if args.group_by_language and not args.skip_asr:
+        pairs = sort_pairs_by_language(pairs, workers=args.lang_group_workers)
 
     paths = apply_shard_paths(eval_paths(args.out_dir), shard_suffix)
     if not args.skip_existing and paths["details_jsonl"].exists():
@@ -1335,7 +1380,9 @@ def main():
         try:
             if need_asr:
                 for gpu_id in asr_gpu_ids:
-                    asr_models[gpu_id] = load_asr_model(batch_size, gpu_id=gpu_id)
+                    asr_models[gpu_id] = load_asr_model(
+                        batch_size, gpu_id=gpu_id, max_new_tokens=args.asr_max_new_tokens
+                    )
 
             if asr_models:
                 from concurrent.futures import ThreadPoolExecutor as _TPE
@@ -1426,7 +1473,7 @@ def main():
         asr_models = {}
         if not args.skip_asr and any(not has_cached_asr_text(asr_results, w, j) for w, j in pairs):
             for gpu_id in asr_gpu_ids:
-                asr_models[gpu_id] = load_asr_model(batch_size, gpu_id=gpu_id)
+                asr_models[gpu_id] = load_asr_model(batch_size, gpu_id=gpu_id, max_new_tokens=args.asr_max_new_tokens)
 
         num_asr_gpus = len(asr_gpu_ids)
         print(

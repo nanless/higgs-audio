@@ -24,7 +24,9 @@ from postprocess_common import (
     DEFAULT_MIN_SIM,
     classify,
     load_cer_data,
+    load_cer_map_sidecars,
     load_sim_data,
+    load_sim_map_sidecars,
     scan_clone_wavs,
 )
 
@@ -134,6 +136,13 @@ def main():
     parser.add_argument("--min-sim", type=float, default=DEFAULT_MIN_SIM)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument(
+        "--eval-source",
+        choices=("sidecar", "jsonl"),
+        default="sidecar",
+        help="sidecar=read per-clone .cer.json/.sim.json (authoritative, fresh); jsonl=aggregate details",
+    )
+    parser.add_argument("--eval-workers", type=int, default=32, help="Parallel workers for reading eval sidecars")
     args = parser.parse_args()
 
     if not args.out_dir.is_dir():
@@ -141,10 +150,14 @@ def main():
         sys.exit(1)
 
     print("=== Loading eval maps ===", file=sys.stderr)
-    cer_records = load_cer_data(args.out_dir)
-    sim_records = load_sim_data(args.out_dir)
-    cer_map = {r["wav"]: r.get("manual_cer") for r in cer_records}
-    sim_map = {r["wav"]: r.get("similarity") for r in sim_records}
+    if args.eval_source == "sidecar":
+        cer_map = load_cer_map_sidecars(args.out_dir, workers=args.eval_workers)
+        sim_map = load_sim_map_sidecars(args.out_dir, workers=args.eval_workers)
+    else:
+        cer_records = load_cer_data(args.out_dir)
+        sim_records = load_sim_data(args.out_dir)
+        cer_map = {r["wav"]: r.get("manual_cer") for r in cer_records}
+        sim_map = {r["wav"]: r.get("similarity") for r in sim_records}
 
     print("=== Scanning disk ===", file=sys.stderr)
     wavs = scan_clone_wavs(args.out_dir, workers=args.workers)

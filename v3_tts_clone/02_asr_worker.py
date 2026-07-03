@@ -108,7 +108,7 @@ def main():
         print(f"GPU {gpu_id}: nothing to do, exiting", flush=True)
         return
 
-    for lang, files in sorted(lang_files.items()):
+    for lang, files in sorted(lang_files.items(), key=lambda x: (x[0] is None, x[0] or "")):
         print(f"GPU {gpu_id}:   lang={lang or 'auto'}: {len(files)} files", flush=True)
 
     # ---- Phase 3: Load model ----
@@ -129,7 +129,7 @@ def main():
     errors = 0
     t0 = time.time()
 
-    for lang, files in sorted(lang_files.items()):
+    for lang, files in sorted(lang_files.items(), key=lambda x: (x[0] is None, x[0] or "")):
         lang_label = lang or "auto"
         n = len(files)
         print(f"GPU {gpu_id}: processing lang={lang_label}, {n} files", flush=True)
@@ -158,15 +158,12 @@ def main():
 
             except Exception as e:
                 errors += len(batch)
-                for path in paths:
-                    try:
-                        with open(path + ".json", "w") as jf:
-                            json.dump(
-                                {"audio_path": path, "transcript": "", "language": "", "error": str(e)[:200]},
-                                ensure_ascii=False,
-                            )
-                    except Exception:
-                        pass
+                # Do not write a sidecar on failure: leaving {path}.json absent means
+                # these files are retried on the next run (implicit retry for transient errors).
+                print(
+                    f"[GPU {gpu_id}] batch failed ({len(batch)} files), will retry next run: {str(e)[:200]}",
+                    flush=True,
+                )
 
             # Progress
             total_done = processed + errors

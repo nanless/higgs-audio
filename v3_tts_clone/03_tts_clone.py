@@ -49,6 +49,11 @@ DEFAULT_REF_MODE = "random"
 DEFAULT_REF_ROTATE_EVERY = 50
 DEFAULT_REF_POOL_SIZE = 256
 DEFAULT_OUTPUT_SAMPLE_RATE = 16000
+# SGLang audio-token budget. 1024 tokens ~= 40.7s @ 25fps, which truncates long texts
+# (>~250 chars) mid-utterance -> ASR sees short audio -> inflated CER -> over-pruning.
+# Raise for fuller long clones (costs more compute/memory per long clone).
+DEFAULT_MAX_NEW_TOKENS = 1024
+MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS  # set from --max-new-tokens in main()
 
 
 def _next_clone_file_idx(out_dir: str) -> int:
@@ -112,7 +117,7 @@ class SGLangTTSClient:
             "references": [{"audio_path": ref_audio_path, "text": ref_text}],
             "temperature": temperature,
             "top_k": 50,
-            "max_new_tokens": 1024,
+            "max_new_tokens": MAX_NEW_TOKENS,
         }
         for attempt in range(max_retries):
             try:
@@ -429,7 +434,7 @@ def downsample_wav_file(path: str, target_sr: int = DEFAULT_OUTPUT_SAMPLE_RATE) 
     audio, sr = librosa.load(path, sr=None, mono=True)
     if sr == target_sr:
         return sr, target_sr
-    resampled = librosa.resample(audio, orig_sr=sr, target_sr=target_sr, res_type='soxr_vhq')
+    resampled = librosa.resample(audio, orig_sr=sr, target_sr=target_sr, res_type="soxr_vhq")
     sf.write(path, resampled, target_sr)
     return sr, target_sr
 
@@ -653,7 +658,17 @@ def main():
         default=DEFAULT_OUTPUT_SAMPLE_RATE,
         help="Downsample generated clone wav to this sample rate (TTS outputs 24kHz)",
     )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=DEFAULT_MAX_NEW_TOKENS,
+        help="SGLang audio-token cap (1024~=40.7s; raise so long texts aren't truncated mid-utterance)",
+    )
     args = parser.parse_args()
+
+    global MAX_NEW_TOKENS
+    MAX_NEW_TOKENS = args.max_new_tokens
+    print(f"max_new_tokens (audio budget) = {MAX_NEW_TOKENS} (~{MAX_NEW_TOKENS / 25.14:.0f}s cap)", flush=True)
 
     # Servers
     servers = [f"http://localhost:{args.base_port + i}" for i in range(args.num_servers)]

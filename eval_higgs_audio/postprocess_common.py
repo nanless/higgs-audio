@@ -291,6 +291,92 @@ def scan_clone_wavs(out_dir: Path, workers: int = 16) -> list[str]:
     return wavs
 
 
+# ---- Authoritative per-clone eval maps from sidecars (parallel) ----
+# Unlike load_cer_data/load_sim_data (which read the append-only aggregate JSONL and
+# keep the FIRST record per wav), these read the per-clone .cer.json / .sim.json
+# sidecars directly. Sidecars are deleted on prune and regenerated on re-eval, so they
+# are always current -- immune to the stale-first-record problem when a clone index is
+# reused across rounds.
+
+
+def _list_speaker_dirs(out_dir: Path) -> list[str]:
+    """All dataset/speaker directories under a clone root."""
+    dirs: list[str] = []
+    for ds in out_dir.iterdir():
+        if not ds.is_dir() or ds.name in SKIP_DIR_NAMES:
+            continue
+        try:
+            for spk in ds.iterdir():
+                if spk.is_dir() and spk.name not in SKIP_DIR_NAMES:
+                    dirs.append(str(spk))
+        except OSError:
+            continue
+    return dirs
+
+
+def _scan_sidecars(task: tuple) -> list[tuple[str, float | None]]:
+    """Worker: read `suffix` sidecars under the given speaker dirs -> (wav_path, value)."""
+    dirs, suffix, wav_key, val_key = task
+    out: list[tuple[str, float | None]] = []
+    for d in dirs:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(suffix):
+                continue
+            fp = os.path.join(d, name)
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    rec = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            wav = rec.get(wav_key) or (fp[: -len(suffix)] + ".wav")
+            out.append((wav, rec.get(val_key)))
+    return out
+
+
+def _load_sidecar_map(
+    out_dir: Path, suffix: str, wav_key: str, val_key: str, workers: int, label: str
+) -> dict[str, float | None]:
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    out_dir = Path(out_dir)
+    spk_dirs = _list_speaker_dirs(out_dir)
+    t0 = time.time()
+    result: dict[str, float | None] = {}
+    if not spk_dirs:
+        print(f"WARN: no speaker dirs under {out_dir}", file=sys.stderr)
+        return result
+    if workers > 1 and len(spk_dirs) > 1:
+        shards = [spk_dirs[i::workers] for i in range(workers)]
+        tasks = [(s, suffix, wav_key, val_key) for s in shards if s]
+        with ProcessPoolExecutor(max_workers=len(tasks)) as ex:
+            futs = [ex.submit(_scan_sidecars, t) for t in tasks]
+            for fut in as_completed(futs):
+                for wav, val in fut.result():
+                    result[wav] = val
+    else:
+        for wav, val in _scan_sidecars((spk_dirs, suffix, wav_key, val_key)):
+            result[wav] = val
+    print(
+        f"[{label}] {len(result):,} sidecars from {len(spk_dirs):,} speakers ({workers}p) in {time.time() - t0:.1f}s",
+        file=sys.stderr,
+    )
+    return result
+
+
+def load_cer_map_sidecars(out_dir: Path, workers: int = 32) -> dict[str, float | None]:
+    """Authoritative {wav_path: manual_cer} from per-clone .cer.json (parallel)."""
+    return _load_sidecar_map(out_dir, ".cer.json", "wav_path", "manual_cer", workers, "CER-sidecar")
+
+
+def load_sim_map_sidecars(out_dir: Path, workers: int = 32) -> dict[str, float | None]:
+    """Authoritative {wav_path: similarity} from per-clone .sim.json (parallel)."""
+    return _load_sidecar_map(out_dir, ".sim.json", "cloned_audio", "similarity", workers, "SIM-sidecar")
+
+
 def parse_higgs_target(sim_rec: dict, cloned_path: str, out_dir: Path) -> tuple[str, str, str] | None:
     """Map a clone to (target_dataset, target_speaker, ref_stem) for copy."""
     dataset = sim_rec.get("dataset")
