@@ -68,6 +68,7 @@ ASR_MAX_NEW_TOKENS="${ASR_MAX_NEW_TOKENS:-512}"
 TTS_MAX_NEW_TOKENS="${TTS_MAX_NEW_TOKENS:-1024}"
 PRUNE_WORKERS="${PRUNE_WORKERS:-32}"
 SCAN_WORKERS="${SCAN_WORKERS:-64}"    # 全盘扫描并行进程数 (128 核, 网络盘 I/O 密集, 用大值猛猛加速)
+SIM_WORKERS="${SIM_WORKERS:-16}"      # SIM 评估进程数 (每卡 4 个, 4 卡=16; 逐条计算不变, 填满 GPU)
 SEED="${SEED:-42}"
 START_ROUND="${START_ROUND:-1}"
 START_STEP="${START_STEP:-clone}"
@@ -508,7 +509,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --skip-existing \
                 --gpus ${ALL_GPUS} \
                 --scan-workers ${SCAN_WORKERS} \
-                --workers 4" || echo "⚠️  SIM 评估失败，跳过 SIM 剪枝，继续 CER"
+                --workers ${SIM_WORKERS}" || echo "⚠️  SIM 评估失败，跳过 SIM 剪枝，继续 CER"
 
         # 释放 SIM 占用的 GPU, 防止残留 (含 spawn worker) 影响后续 CER/TTS
         pkill -f "eval_sim.py" 2>/dev/null || true
