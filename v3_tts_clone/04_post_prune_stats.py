@@ -124,6 +124,17 @@ def _process_row(row: dict, clone_root: str, target_sec: float = TARGET_DURATION
     return base
 
 
+def _process_chunk(rows_chunk: list[dict], clone_root: str, target_sec: float) -> list[dict]:
+    """Process a batch of rows in one worker. Chunking avoids the ProcessPoolExecutor
+    deadlock/overhead from submitting tens of thousands of tiny per-row tasks."""
+    out: list[dict] = []
+    for row in rows_chunk:
+        r = _process_row(row, clone_root, target_sec)
+        if r is not None:
+            out.append(r)
+    return out
+
+
 def allocate_clone_budget(
     results: list[dict],
     total_clone_hours: float,
@@ -175,12 +186,12 @@ def main():
 
     t0 = time.time()
     results: list[dict] = []
+    chunk_size = 200
+    chunks = [rows[i : i + chunk_size] for i in range(0, len(rows), chunk_size)]
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(_process_row, row, args.clone_root, target_sec) for row in rows]
+        futs = [ex.submit(_process_chunk, c, args.clone_root, target_sec) for c in chunks]
         for fut in as_completed(futs):
-            r = fut.result()
-            if r is not None:
-                results.append(r)
+            results.extend(fut.result())
 
     allocate_clone_budget(results, args.total_clone_hours, args.estimate_clone_duration)
     results.sort(key=lambda x: (x["status"] != "NEED_CLONE", x["total_duration_sec"]))
