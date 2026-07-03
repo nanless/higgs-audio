@@ -96,14 +96,16 @@ def generate_task_list(config: GenConfig) -> List[Dict]:
         length_key = rng.choices(length_keys, weights=length_probs, k=1)[0]
         lang_key = rng.choices(lang_keys, weights=lang_probs, k=1)[0]
 
-        tasks.append({
-            "scenario_key": scenario_key,
-            "subscene": subscene,
-            "emotion": emotion,
-            "length_key": length_key,
-            "lang_key": lang_key,
-            "is_stress_test": False,
-        })
+        tasks.append(
+            {
+                "scenario_key": scenario_key,
+                "subscene": subscene,
+                "emotion": emotion,
+                "length_key": length_key,
+                "lang_key": lang_key,
+                "is_stress_test": False,
+            }
+        )
 
     for i in range(num_stress):
         sk = stress_keys[i % len(stress_keys)] if stress_keys else scenario_keys[0]
@@ -115,14 +117,16 @@ def generate_task_list(config: GenConfig) -> List[Dict]:
         length_key = rng.choices(length_keys, weights=length_probs, k=1)[0]
         lang_key = rng.choices(lang_keys, weights=lang_probs, k=1)[0]
 
-        tasks.append({
-            "scenario_key": sk,
-            "subscene": subscene,
-            "emotion": emotion,
-            "length_key": length_key,
-            "lang_key": lang_key,
-            "is_stress_test": True,
-        })
+        tasks.append(
+            {
+                "scenario_key": sk,
+                "subscene": subscene,
+                "emotion": emotion,
+                "length_key": length_key,
+                "lang_key": lang_key,
+                "is_stress_test": True,
+            }
+        )
 
     rng.shuffle(tasks)
     for idx, task in enumerate(tasks):

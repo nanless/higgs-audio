@@ -1,9 +1,9 @@
 """
 Step 3: TTS Voice Cloning via SGLang-Omni Local Servers.
 
-For each low-duration speaker (< 3600s, >= 20 audio files):
+For each low-duration speaker (< target seconds, default 3600, >= 20 audio files):
 1. Select reference audio (7-20s, with ASR transcript from step 2)
-2. Calculate clones needed to reach 3600s (with 2x buffer for 50% quality pass rate)
+2. Calculate clones needed to reach the target (--target-sec, default 3600; 2x buffer for 50% pass rate)
 3. Generate clones via local SGLang Higgs v3 TTS servers (one per GPU)
 4. Save audio + JSON metadata under audio_higgs_audio_v3_tts_clone/{dataset}/{speaker_id}/
 
@@ -686,7 +686,7 @@ def main():
             print(f"  {url} → NOT REACHABLE (make sure SGLang servers are running)", flush=True)
             sys.exit(1)
 
-    # Load tasks — filter: <3600s AND >= 20 audio files (or post-prune resume CSV)
+    # Load tasks — filter: < target sec (--target-sec) AND >= 20 audio files (or post-prune resume CSV)
     tasks = []
     all_low = 0
     filtered_out = 0

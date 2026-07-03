@@ -1,4 +1,5 @@
 """批量使用 Higgs Audio v3 复刻童声。"""
+
 import os
 import sys
 import time
@@ -23,10 +24,10 @@ for i, sample_dir in enumerate(sample_dirs):
     output_audio = os.path.join(sample_dir, "cloned_audio.wav")
 
     if not os.path.exists(prompt_audio):
-        print(f"[{i+1}/{len(sample_dirs)}] {sample_name}: SKIP - 缺少 prompt_audio.wav")
+        print(f"[{i + 1}/{len(sample_dirs)}] {sample_name}: SKIP - 缺少 prompt_audio.wav")
         continue
     if not os.path.exists(cloned_text_file):
-        print(f"[{i+1}/{len(sample_dirs)}] {sample_name}: SKIP - 缺少 cloned_text.txt")
+        print(f"[{i + 1}/{len(sample_dirs)}] {sample_name}: SKIP - 缺少 cloned_text.txt")
         continue
 
     with open(cloned_text_file, "r", encoding="utf-8") as f:
@@ -44,7 +45,7 @@ for i, sample_dir in enumerate(sample_dirs):
     }
 
     try:
-        print(f"[{i+1}/{len(sample_dirs)}] {sample_name}: 生成中...", end=" ", flush=True)
+        print(f"[{i + 1}/{len(sample_dirs)}] {sample_name}: 生成中...", end=" ", flush=True)
         start = time.time()
         resp = requests.post(API_URL, json=payload, timeout=120)
         elapsed = time.time() - start
@@ -63,6 +64,6 @@ for i, sample_dir in enumerate(sample_dirs):
         fail_count += 1
 
     if (i + 1) % 10 == 0:
-        print(f"  进度: {i+1}/{len(sample_dirs)}, 成功 {success_count}, 失败 {fail_count}")
+        print(f"  进度: {i + 1}/{len(sample_dirs)}, 成功 {success_count}, 失败 {fail_count}")
 
 print(f"\n完成! 成功 {success_count}, 失败 {fail_count}")

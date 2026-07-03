@@ -9,21 +9,39 @@ class GenConfig:
     batch_size: int = 8
     max_workers: int = 1
 
-    scenario_distribution: Dict[str, float] = field(default_factory=lambda: {
-        "daily_chat": 2.0, "business": 1.0, "education": 1.5,
-        "emotional": 1.5, "entertainment": 1.8, "narration": 1.2,
-        "social_media": 1.8, "service": 0.8, "creative_writing": 1.2,
-        "asr_stress": 1.0,
-    })
+    scenario_distribution: Dict[str, float] = field(
+        default_factory=lambda: {
+            "daily_chat": 2.0,
+            "business": 1.0,
+            "education": 1.5,
+            "emotional": 1.5,
+            "entertainment": 1.8,
+            "narration": 1.2,
+            "social_media": 1.8,
+            "service": 0.8,
+            "creative_writing": 1.2,
+            "asr_stress": 1.0,
+        }
+    )
 
-    length_distribution: Dict[str, float] = field(default_factory=lambda: {
-        "ultra_short": 0.15, "short": 0.30, "medium": 0.30,
-        "long": 0.18, "very_long": 0.07,
-    })
+    length_distribution: Dict[str, float] = field(
+        default_factory=lambda: {
+            "ultra_short": 0.15,
+            "short": 0.30,
+            "medium": 0.30,
+            "long": 0.18,
+            "very_long": 0.07,
+        }
+    )
 
-    lang_mix_distribution: Dict[str, float] = field(default_factory=lambda: {
-        "pure_cn": 0.45, "pure_en": 0.35, "cn_main": 0.12, "en_main": 0.08,
-    })
+    lang_mix_distribution: Dict[str, float] = field(
+        default_factory=lambda: {
+            "pure_cn": 0.45,
+            "pure_en": 0.35,
+            "cn_main": 0.12,
+            "en_main": 0.08,
+        }
+    )
 
     stress_test_ratio: float = 0.10
 

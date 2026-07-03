@@ -9,6 +9,7 @@ from typing import Dict, List, Set, Tuple
 
 def _normalize_for_dup_check(text: str) -> str:
     import re
+
     t = re.sub(r"<\|(emotion|style|sfx|prosody):[a-z_]+\|>", "", text)
     t = re.sub(r"\d+", "<NUM>", t)
     t = t.lower().strip()
@@ -18,7 +19,7 @@ def _normalize_for_dup_check(text: str) -> str:
 
 
 def _shingle_set(text: str, n: int = 3) -> Set[str]:
-    return set(text[i:i + n] for i in range(len(text) - n + 1))
+    return set(text[i : i + n] for i in range(len(text) - n + 1))
 
 
 def _semantic_similarity(text_a: str, text_b: str) -> float:

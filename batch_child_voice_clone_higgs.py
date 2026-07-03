@@ -24,7 +24,7 @@ from boson_multimodal.data_types import Message, ChatMLSample, AudioContent, Tex
 from boson_multimodal.audio_processing.higgs_audio_tokenizer import load_higgs_audio_tokenizer
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 # Random English sentence templates for generation
 ENGLISH_SENTENCES = [
@@ -140,54 +140,55 @@ def load_kaldi_files(wav_scp_path, text_tn_path):
     """Load wav.scp and text.tn files"""
     wav_dict = {}
     text_dict = {}
-    
+
     # Load wav.scp
-    with open(wav_scp_path, 'r', encoding='utf-8') as f:
+    with open(wav_scp_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                parts = line.split('\t')
+                parts = line.split("\t")
                 if len(parts) == 2:
                     utt_id, wav_path = parts
                     wav_dict[utt_id] = wav_path
-    
+
     # Load text.tn
-    with open(text_tn_path, 'r', encoding='utf-8') as f:
+    with open(text_tn_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                parts = line.split('\t')
+                parts = line.split("\t")
                 if len(parts) == 2:
                     utt_id, text = parts
                     text_dict[utt_id] = text
-    
+
     # Find common utterance IDs
     common_ids = set(wav_dict.keys()) & set(text_dict.keys())
-    
+
     logger.info(f"Loaded {len(wav_dict)} audio files")
     logger.info(f"Loaded {len(text_dict)} text entries")
     logger.info(f"Found {len(common_ids)} matched pairs")
-    
+
     return wav_dict, text_dict, list(common_ids)
 
 
 def generate_random_english_sentence():
     """Generate a random English sentence"""
     sentence = random.choice(ALL_SENTENCES)
-    
+
     # If sentence has placeholder, fill it with a random name
-    if '{name}' in sentence:
-        names = ['Tom', 'Lucy', 'Jack', 'Emma', 'Mike', 'Sarah', 'David', 'Anna']
+    if "{name}" in sentence:
+        names = ["Tom", "Lucy", "Jack", "Emma", "Mike", "Sarah", "David", "Anna"]
         sentence = sentence.format(name=random.choice(names))
-    
+
     return sentence
 
 
-def save_sample_directory(idx, utt_id, audio_path, original_text, generated_text, 
-                          output_audio, output_sr, base_output_dir):
+def save_sample_directory(
+    idx, utt_id, audio_path, original_text, generated_text, output_audio, output_sr, base_output_dir
+):
     """
     Save a complete sample in its own subdirectory
-    
+
     Directory structure:
     sample_0001_<utt_id>/
         ├── prompt_audio.wav          (original audio)
@@ -199,69 +200,69 @@ def save_sample_directory(idx, utt_id, audio_path, original_text, generated_text
     sample_dir_name = f"sample_{idx:04d}_{utt_id}"
     sample_dir = Path(base_output_dir) / sample_dir_name
     sample_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # 1. Copy prompt audio
     prompt_audio_path = sample_dir / "prompt_audio.wav"
     shutil.copy2(audio_path, prompt_audio_path)
     logger.info(f"  → Prompt audio: {prompt_audio_path}")
-    
+
     # 2. Save cloned audio
     cloned_audio_path = sample_dir / "cloned_audio.wav"
     sf.write(str(cloned_audio_path), output_audio, output_sr)
     logger.info(f"  → Cloned audio: {cloned_audio_path}")
-    
+
     # 3. Save prompt text
     prompt_text_path = sample_dir / "prompt_text.txt"
-    with open(prompt_text_path, 'w', encoding='utf-8') as f:
+    with open(prompt_text_path, "w", encoding="utf-8") as f:
         f.write(original_text)
     logger.info(f"  → Prompt text: {prompt_text_path}")
-    
+
     # 4. Save cloned text
     cloned_text_path = sample_dir / "cloned_text.txt"
-    with open(cloned_text_path, 'w', encoding='utf-8') as f:
+    with open(cloned_text_path, "w", encoding="utf-8") as f:
         f.write(generated_text)
     logger.info(f"  → Cloned text: {cloned_text_path}")
-    
+
     return sample_dir
 
 
 def batch_clone(args, serve_engine, wav_dict, text_dict, selected_ids):
     """Batch process voice cloning using Higgs-Audio"""
-    
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Create a CSV file to record results
     results_csv = output_dir / "clone_results.csv"
-    with open(results_csv, 'w', encoding='utf-8') as f:
+    with open(results_csv, "w", encoding="utf-8") as f:
         f.write("ID,Original_Audio,Original_Text,Generated_Text,Output_Directory,Status\n")
-    
+
     success_count = 0
     failed_count = 0
-    
+
     for idx, utt_id in enumerate(selected_ids, 1):
-        logger.info(f"\n{'='*80}")
+        logger.info(f"\n{'=' * 80}")
         logger.info(f"Processing {idx}/{len(selected_ids)}: {utt_id}")
-        logger.info(f"{'='*80}")
-        
+        logger.info(f"{'=' * 80}")
+
         try:
             # Get audio path and original text
             audio_path = wav_dict[utt_id]
             original_text = text_dict[utt_id]
-            
+
             # Check if audio file exists
             if not os.path.exists(audio_path):
                 logger.error(f"Audio file not found: {audio_path}")
                 failed_count += 1
                 continue
-            
+
             # Generate random English sentence
             generated_text = generate_random_english_sentence()
-            
+
             logger.info(f"Original text: {original_text}")
             logger.info(f"Generated text: {generated_text}")
             logger.info(f"Audio path: {audio_path}")
-            
+
             # Prepare messages for voice cloning (similar to examples/generation.py)
             system_prompt = (
                 "Generate audio following instruction.\n\n"
@@ -269,7 +270,7 @@ def batch_clone(args, serve_engine, wav_dict, text_dict, selected_ids):
                 "Audio is recorded from a quiet room.\n"
                 "<|scene_desc_end|>"
             )
-            
+
             messages = [
                 Message(
                     role="system",
@@ -290,7 +291,7 @@ def batch_clone(args, serve_engine, wav_dict, text_dict, selected_ids):
                     content=generated_text,
                 ),
             ]
-            
+
             # Perform voice cloning
             logger.info("[INFO] Starting inference...")
             output: HiggsAudioResponse = serve_engine.generate(
@@ -302,159 +303,121 @@ def batch_clone(args, serve_engine, wav_dict, text_dict, selected_ids):
                 stop_strings=["<|end_of_text|>", "<|eot_id|>"],
                 seed=args.seed,
             )
-            
+
             if output.audio is not None and len(output.audio) > 0:
                 # Save complete sample in subdirectory
                 sample_dir = save_sample_directory(
-                    idx, utt_id, audio_path, original_text, generated_text,
-                    output.audio, output.sampling_rate, args.output_dir
+                    idx,
+                    utt_id,
+                    audio_path,
+                    original_text,
+                    generated_text,
+                    output.audio,
+                    output.sampling_rate,
+                    args.output_dir,
                 )
-                
+
                 # Record success
-                with open(results_csv, 'a', encoding='utf-8') as f:
+                with open(results_csv, "a", encoding="utf-8") as f:
                     f.write(f"{utt_id},{audio_path},{original_text},{generated_text},{sample_dir},SUCCESS\n")
-                
+
                 success_count += 1
                 logger.info(f"✓ Successfully cloned and saved to: {sample_dir.name}")
             else:
                 logger.error(f"✗ Clone failed for {utt_id}: Empty audio output")
                 failed_count += 1
-                with open(results_csv, 'a', encoding='utf-8') as f:
+                with open(results_csv, "a", encoding="utf-8") as f:
                     f.write(f"{utt_id},{audio_path},{original_text},{generated_text},,FAILED\n")
-        
+
         except Exception as e:
             logger.error(f"✗ Error processing {utt_id}: {str(e)}")
             failed_count += 1
-            with open(results_csv, 'a', encoding='utf-8') as f:
-                f.write(f"{utt_id},{audio_path if 'audio_path' in locals() else 'N/A'},{original_text if 'original_text' in locals() else 'N/A'},,,ERROR: {str(e)}\n")
-    
-    logger.info(f"\n{'='*80}")
+            with open(results_csv, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{utt_id},{audio_path if 'audio_path' in locals() else 'N/A'},{original_text if 'original_text' in locals() else 'N/A'},,,ERROR: {str(e)}\n"
+                )
+
+    logger.info(f"\n{'=' * 80}")
     logger.info(f"Batch processing completed!")
     logger.info(f"Total: {len(selected_ids)} | Success: {success_count} | Failed: {failed_count}")
     logger.info(f"Results saved to: {results_csv}")
-    logger.info(f"{'='*80}")
+    logger.info(f"{'=' * 80}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Batch child voice cloning for Higgs-Audio")
-    
+
     # Data paths
     parser.add_argument(
         "--wav-scp",
         type=str,
         default="/root/group-shared/voiceprint/data/speech/speaker_verification/BAAI-ChildMandarin41.25H_integrated_by_groundtruth/kaldi_files/wav.scp",
-        help="Path to wav.scp file"
+        help="Path to wav.scp file",
     )
     parser.add_argument(
         "--text-tn",
         type=str,
         default="/root/group-shared/voiceprint/data/speech/speaker_verification/BAAI-ChildMandarin41.25H_integrated_by_groundtruth/kaldi_files/text.tn",
-        help="Path to text.tn file"
+        help="Path to text.tn file",
     )
-    
+
     # Model paths
     parser.add_argument(
-        "--model-path",
-        type=str,
-        default="bosonai/higgs-audio-v2-generation-3B-base",
-        help="Higgs-Audio model path"
+        "--model-path", type=str, default="bosonai/higgs-audio-v2-generation-3B-base", help="Higgs-Audio model path"
     )
     parser.add_argument(
         "--audio-tokenizer-path",
         type=str,
         default="bosonai/higgs-audio-v2-tokenizer",
-        help="Higgs-Audio tokenizer path"
+        help="Higgs-Audio tokenizer path",
     )
     parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="./child_voice_clone_output_higgs",
-        help="Output directory for cloned audio"
+        "--output-dir", type=str, default="./child_voice_clone_output_higgs", help="Output directory for cloned audio"
     )
-    
+
     # Sampling parameters
     parser.add_argument(
-        "--num-samples",
-        type=int,
-        default=100,
-        help="Number of samples to randomly select (default: 100)"
+        "--num-samples", type=int, default=100, help="Number of samples to randomly select (default: 100)"
     )
-    parser.add_argument(
-        "--random-seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducibility"
-    )
-    
+    parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
+
     # Generation parameters
+    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum number of tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.3, help="Temperature for sampling")
+    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p for nucleus sampling")
+    parser.add_argument("--top-k", type=int, default=50, help="Top-k for sampling")
+    parser.add_argument("--seed", type=int, default=1988, help="Model random seed")
     parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=1024,
-        help="Maximum number of tokens to generate"
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run the model on"
     )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.3,
-        help="Temperature for sampling"
-    )
-    parser.add_argument(
-        "--top-p",
-        type=float,
-        default=0.95,
-        help="Top-p for nucleus sampling"
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=50,
-        help="Top-k for sampling"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=1988,
-        help="Model random seed"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run the model on"
-    )
-    
+
     args = parser.parse_args()
-    
+
     # Set random seed
     random.seed(args.random_seed)
     torch.manual_seed(args.seed)
-    
+
     # Load kaldi files
     logger.info("Loading kaldi files...")
     wav_dict, text_dict, common_ids = load_kaldi_files(args.wav_scp, args.text_tn)
-    
+
     # Randomly select samples
     if len(common_ids) < args.num_samples:
         logger.warning(f"Requested {args.num_samples} samples but only {len(common_ids)} available")
         args.num_samples = len(common_ids)
-    
+
     selected_ids = random.sample(common_ids, args.num_samples)
     logger.info(f"Randomly selected {len(selected_ids)} samples")
-    
+
     # Load Higgs-Audio model
     logger.info(f"Loading Higgs-Audio model from: {args.model_path}")
     try:
-        serve_engine = HiggsAudioServeEngine(
-            args.model_path, 
-            args.audio_tokenizer_path, 
-            device=args.device
-        )
+        serve_engine = HiggsAudioServeEngine(args.model_path, args.audio_tokenizer_path, device=args.device)
         logger.info("✓ Higgs-Audio model loaded successfully")
     except Exception as e:
         logger.error(f"❌ Error loading model: {e}")
         exit(1)
-    
+
     # Batch process
     logger.info("\nStarting batch voice cloning...")
     batch_clone(args, serve_engine, wav_dict, text_dict, selected_ids)
@@ -462,4 +425,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

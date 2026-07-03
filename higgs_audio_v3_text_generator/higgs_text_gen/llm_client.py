@@ -29,17 +29,14 @@ def call_llm(
         or "EMPTY"
     )
     resolved_model = model or os.environ.get("LLM_MODEL", "qwen3.6-27b")
-    resolved_base_url = (
-        base_url.rstrip("/")
-        or os.environ.get("LLM_BASE_URL", "http://localhost:8000").rstrip("/")
-    )
+    resolved_base_url = base_url.rstrip("/") or os.environ.get("LLM_BASE_URL", "http://localhost:8000").rstrip("/")
 
     def _extract_json(raw_text: str) -> List[Dict]:
         text = raw_text.strip()
         # Qwen3.6 thinking mode: strip think content
         think_end = text.rfind("</think>")
         if think_end != -1:
-            text = text[think_end + len("</think>"):].strip()
+            text = text[think_end + len("</think>") :].strip()
         for marker in ("```json", "```"):
             if marker in text:
                 text = text.split(marker, 1)[1]
@@ -105,7 +102,7 @@ def call_llm(
         except Exception as e:
             last_error = str(e)
         if attempt < max_retries - 1:
-            wait = retry_base_delay * (2 ** attempt)
+            wait = retry_base_delay * (2**attempt)
             time.sleep(wait)
 
     print(f"LLM call failed after {max_retries} retries: {last_error}")

@@ -216,7 +216,7 @@ PYEOF
 # ====================================================================
 if [ ! -f "${STATS_CSV}" ]; then
     echo "❌ STATS_CSV 不存在: ${STATS_CSV}"
-    echo "   请先运行: python3 v3_tts_clone/00_prepare_stats.py --source-dirs ... --clone-dirs ..."
+    echo "   请先运行(只算源音频, 不带 --clone-dirs): python3 v3_tts_clone/00_prepare_stats.py --source-dirs {audio} --target-sec ${TARGET_SEC} --output-dir <dir>"
     exit 1
 fi
 

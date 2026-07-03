@@ -17,6 +17,7 @@ from higgs_text_gen.output import save_jsonl, print_statistics
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", default="batch_output")
     parser.add_argument("--output", default="batch_output/generated_texts_final.jsonl")

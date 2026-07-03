@@ -21,17 +21,15 @@ from higgs_text_gen.tags import RECOMMENDED_COMBINATIONS
 
 def main():
     parser = argparse.ArgumentParser(description="Generate expressive texts for Higgs Audio v3 TTS")
-    parser.add_argument("--scenario", type=str, default="daily_chat",
-                        choices=list(SCENARIOS.keys()),
-                        help="Scenario key")
-    parser.add_argument("--subscene", type=str, default=None,
-                        help="Specific subscene (auto-picked if not set)")
-    parser.add_argument("--emotion", type=str, default="enthusiasm",
-                        choices=EMOTIONS, help="Emotion to convey")
-    parser.add_argument("--length", type=str, default="medium",
-                        choices=list(LENGTH_SPECS.keys()), help="Text length")
-    parser.add_argument("--lang", type=str, default="pure_cn",
-                        choices=list(LANG_MIX_SPECS.keys()), help="Language type")
+    parser.add_argument(
+        "--scenario", type=str, default="daily_chat", choices=list(SCENARIOS.keys()), help="Scenario key"
+    )
+    parser.add_argument("--subscene", type=str, default=None, help="Specific subscene (auto-picked if not set)")
+    parser.add_argument("--emotion", type=str, default="enthusiasm", choices=EMOTIONS, help="Emotion to convey")
+    parser.add_argument("--length", type=str, default="medium", choices=list(LENGTH_SPECS.keys()), help="Text length")
+    parser.add_argument(
+        "--lang", type=str, default="pure_cn", choices=list(LANG_MIX_SPECS.keys()), help="Language type"
+    )
     parser.add_argument("--count", type=int, default=5, help="Number of texts to generate")
     parser.add_argument("--temperature", type=float, default=0.85, help="LLM temperature")
     parser.add_argument("--model", type=str, default=None, help="LLM model name")
@@ -48,7 +46,7 @@ def main():
     if args.list_scenarios:
         print("\nAvailable scenarios:")
         for key, s in SCENARIOS.items():
-            print(f"  {key}: {s['name']} — {s.get('description','')}")
+            print(f"  {key}: {s['name']} — {s.get('description', '')}")
         return
 
     if args.list_emotions:
@@ -62,6 +60,7 @@ def main():
     if args.list_tags:
         print("\nAll 43 Higgs Audio v3 tags:")
         from higgs_text_gen.tags import HIGGS_V3_TAGS
+
         for cat, tags in HIGGS_V3_TAGS.items():
             print(f"\n  [{cat}]")
             for name, info in tags.items():
@@ -71,7 +70,7 @@ def main():
     if args.list_combinations:
         print("\nRecommended tag combinations:")
         for emotion, combos in RECOMMENDED_COMBINATIONS.items():
-            combo_str = " + ".join(f"<|{c.replace(':','|>')}|>" for c in combos)
+            combo_str = " + ".join(f"<|{c.replace(':', '|>')}|>" for c in combos)
             print(f"  {emotion}: {combo_str}")
         return
 
@@ -131,20 +130,21 @@ def main():
     for i, item in enumerate(results):
         text = item.get("text", "")
         clean = item.get("clean_text", "")
-        print(f"[{i+1}] {text}")
+        print(f"[{i + 1}] {text}")
         if clean != text:
             print(f"    Clean: {clean}")
         print()
 
     if args.output:
         from higgs_text_gen.output import save_jsonl
+
         save_jsonl(results, args.output)
         print(f"Saved to {args.output}")
 
     print(f"\nUse these 'text' fields directly as Higgs Audio v3 API 'input' parameter:")
     print("  curl https://api.boson.ai/v1/audio/speech \\")
     print("    -H 'Authorization: Bearer $BOSON_API_KEY' \\")
-    print(f"    -d '{{\"model\":\"higgs-audio-v3-tts\",\"input\":\"{results[0].get('text','')[:50]}...\"}}'")
+    print(f'    -d \'{{"model":"higgs-audio-v3-tts","input":"{results[0].get("text", "")[:50]}..."}}\'')
 
 
 if __name__ == "__main__":

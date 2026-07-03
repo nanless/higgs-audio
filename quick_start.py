@@ -9,9 +9,7 @@ import click
 MODEL_PATH = "bosonai/higgs-audio-v2-generation-3B-base"
 AUDIO_TOKENIZER_PATH = "bosonai/higgs-audio-v2-tokenizer"
 
-system_prompt = (
-    "Generate audio following instruction.\n\n<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
-)
+system_prompt = "Generate audio following instruction.\n\n<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
 
 messages = [
     Message(

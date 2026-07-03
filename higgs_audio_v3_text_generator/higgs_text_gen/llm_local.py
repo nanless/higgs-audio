@@ -42,7 +42,7 @@ def _extract_json(raw_text: str) -> List[Dict]:
     # Qwen3.6 thinking mode: strip think content before JSON
     think_end = text.rfind("</think>")
     if think_end != -1:
-        text = text[think_end + len("</think>"):].strip()
+        text = text[think_end + len("</think>") :].strip()
 
     for marker in ("```json", "```"):
         if marker in text:
@@ -86,7 +86,9 @@ def call_llm_local(
 
     messages = [{"role": "user", "content": prompt}]
     text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
         enable_thinking=False,
     )
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
@@ -101,7 +103,7 @@ def call_llm_local(
                 top_p=0.95,
                 pad_token_id=tokenizer.eos_token_id,
             )
-            generated_ids = outputs[0][inputs.input_ids.shape[1]:]
+            generated_ids = outputs[0][inputs.input_ids.shape[1] :]
             raw = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
             results = _extract_json(raw)
@@ -109,11 +111,11 @@ def call_llm_local(
                 return results
 
             if attempt < max_retries - 1:
-                time.sleep(retry_base_delay * (2 ** attempt))
+                time.sleep(retry_base_delay * (2**attempt))
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"Generation attempt {attempt+1} failed: {e}")
-                time.sleep(retry_base_delay * (2 ** attempt))
+                print(f"Generation attempt {attempt + 1} failed: {e}")
+                time.sleep(retry_base_delay * (2**attempt))
             else:
                 print(f"Generation failed after {max_retries} attempts: {e}")
 

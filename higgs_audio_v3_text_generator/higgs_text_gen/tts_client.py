@@ -51,9 +51,7 @@ class HiggsV3TTSClient:
         resp.raise_for_status()
         return resp.content
 
-    def create_custom_voice(
-        self, ref_audio: str, ref_text: str, title: str = "My Voice"
-    ) -> str:
+    def create_custom_voice(self, ref_audio: str, ref_text: str, title: str = "My Voice") -> str:
         payload = {
             "ref_audio": ref_audio,
             "ref_text": ref_text,
@@ -120,6 +118,7 @@ class HiggsV3TTSClient:
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd")
 

@@ -3,7 +3,7 @@
 
 Combines original source audio duration + remaining kept clone duration.
 Allocates a global clone generation budget (default 10,000 hours) across
-NEED_CLONE speakers proportional to each speaker's gap to 3600s.
+NEED_CLONE speakers proportional to each speaker's gap to the target (--target-duration-sec, default 3600).
 
 Usage:
     python 04_post_prune_stats.py \\

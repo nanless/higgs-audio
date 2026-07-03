@@ -52,8 +52,8 @@ def print_statistics(texts: List[Dict]):
 
     tagged_count = sum(1 for t in texts if t.get("_tag_count", 0) > 0)
     untagged_count = len(texts) - tagged_count
-    print(f"Tagged texts: {tagged_count} ({tagged_count/max(1,len(texts))*100:.1f}%)")
-    print(f"Untagged texts: {untagged_count} ({untagged_count/max(1,len(texts))*100:.1f}%)")
+    print(f"Tagged texts: {tagged_count} ({tagged_count / max(1, len(texts)) * 100:.1f}%)")
+    print(f"Untagged texts: {untagged_count} ({untagged_count / max(1, len(texts)) * 100:.1f}%)")
 
     avg_chars = sum(t.get("char_count", 0) for t in texts) / max(1, len(texts))
     print(f"Average chars per text: {avg_chars:.1f}")

@@ -244,7 +244,7 @@ bash run_1m_gen.sh
 
 ```
 v3_tts_clone/
-├── README.md                       # 174 行详细文档
+├── README.md                       # 迭代克隆流水线详细文档
 ├── 00_prepare_stats.py             # 生成全量说话人统计 (手动跑一次) → all_speakers.csv
 ├── 02_asr_launch.sh                # ASR 启动脚本 (被 05 调用)
 ├── 02_asr_worker.py                # ASR 转写 worker (Qwen3-ASR 1.7B, 每 GPU 一个)
@@ -707,7 +707,7 @@ Sidecar 文件写在每个 clone 音频旁边：`clone_NNNN.cer.json`, `clone_NN
 - **跳过目录**：`logs`、`__pycache__`、`eval_sim_embedding_cache`
 - `CerAccumulator` 使用**字符数加权** CER 而非简单平均
 
-#### eval_cer.py（CER 评估，1498 行）
+#### eval_cer.py（CER 评估，~1700 行）
 - **LLM ITN 默认关闭**——需要 `--enable-llm` 才会启用 LLM 反向文本规范化
 - `load_env_file()` 在**模块导入时**即执行——`.env` 值通过 `os.environ.setdefault` 注入，不会覆盖已存在的环境变量
 - `get_truth_text()` 使用 `@lru_cache(maxsize=200_000)`——大规模评估时可能消耗显著内存
