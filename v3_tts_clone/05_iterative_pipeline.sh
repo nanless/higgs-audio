@@ -14,13 +14,17 @@
 #   source v3_tts_clone/05_iterative_pipeline.env && bash v3_tts_clone/05_iterative_pipeline.sh
 #
 # 环境变量 (可选, 有默认值):
-#   STATS_CSV          — speaker_duration_stats.csv
+#   STATS_CSV          — speaker_duration_stats.csv (Step 0 自动生成, source-only)
+#   STATS_SOURCE_DIRS  — Step 0 要统计的原始音频目录 (默认 = SOURCE_DIRS)
+#   STATS_OUTPUT_DIR   — Step 0 统计输出目录 (默认 = STATS_CSV 所在目录, 写 all_speakers.csv)
+#   FORCE_STATS        — 1 = 即使 STATS_CSV 已存在也强制重新统计 (默认 0)
 #   TEXTS_JSONL        — 文本池 JSONL
 #   CLONE_ROOT         — clone 输出根目录
 #   TOTAL_CLONE_HOURS  — 全局克隆预算 (默认 10000)
 #   TOTAL_ROUNDS       — 总轮数 (默认 10)
 #   BASE_PORT          — SGLang 服务端口 (默认 8000)
-#   NUM_SERVERS        — SGLang 服务数量 (默认 8)
+#   NUM_SERVERS        — SGLang 服务数量 (默认 8, 八卡机)
+#   ALL_GPUS           — ASR/评估用 GPU 列表 (默认 0..7, 八卡机)
 #   WORKERS_PER_SERVER — 每 server 并发数 (默认 16)
 #   START_ROUND        — 从第几轮开始 (默认 1)
 #   START_STEP         — 起始轮从哪步开始: clone|sim|cer (默认 clone; SIM 在前, CER 在后)
@@ -49,17 +53,21 @@ PIPELINE_WORKDIR="${PIPELINE_WORKDIR:-${REPO_ROOT}/clone_workdir/iterative_pipel
 # 原音频目录 (参考音频选取)
 SOURCE_DIRS="${SOURCE_DIRS:-}"
 MERGED_SOURCES_DIR="${PIPELINE_WORKDIR}/merged_sources"
+# Step 0 统计: 要统计的原始音频目录 (默认 = SOURCE_DIRS), 输出目录 (默认 = STATS_CSV 所在目录)
+STATS_SOURCE_DIRS="${STATS_SOURCE_DIRS:-${SOURCE_DIRS}}"
+STATS_OUTPUT_DIR="${STATS_OUTPUT_DIR:-$(dirname "${STATS_CSV}")}"
+FORCE_STATS="${FORCE_STATS:-0}"   # 1 = 即使 STATS_CSV 已存在也强制重新统计
 TOTAL_CLONE_HOURS="${TOTAL_CLONE_HOURS:-10000}"
 TOTAL_ROUNDS="${TOTAL_ROUNDS:-10}"
 BASE_PORT="${BASE_PORT:-8000}"
-NUM_SERVERS="${NUM_SERVERS:-4}"
+NUM_SERVERS="${NUM_SERVERS:-8}"
 WORKERS_PER_SERVER="${WORKERS_PER_SERVER:-16}"
 ESTIMATE_CLONE_DURATION="${ESTIMATE_CLONE_DURATION:-10}"
 QUALITY_PASS_RATE="${QUALITY_PASS_RATE:-0.5}"
 MAX_CER="${MAX_CER:-0.03}"
 MIN_SIM="${MIN_SIM:-0.8}"        # raw 余弦阈值 (编码器已改为 raw cos)
 TARGET_SEC="${TARGET_SEC:-3600}"  # 每说话人目标时长(秒); 本次生产用 1800 (半小时)
-ALL_GPUS="${ALL_GPUS:-0,1,2,3}"
+ALL_GPUS="${ALL_GPUS:-0,1,2,3,4,5,6,7}"
 ASR_BACKEND="${ASR_BACKEND:-vllm}"          # vllm (连续批处理, 高 GPU 利用率) | transformers
 ASR_BATCH_SIZE="${ASR_BATCH_SIZE:-32}"       # transformers 后端每卡 batch
 ASR_VLLM_BATCH="${ASR_VLLM_BATCH:-256}"      # vllm 后端喂给引擎的批大小 (越大越能填满连续批处理)
@@ -69,7 +77,7 @@ ASR_MAX_NEW_TOKENS="${ASR_MAX_NEW_TOKENS:-512}"
 TTS_MAX_NEW_TOKENS="${TTS_MAX_NEW_TOKENS:-1024}"
 PRUNE_WORKERS="${PRUNE_WORKERS:-32}"
 SCAN_WORKERS="${SCAN_WORKERS:-64}"    # 全盘扫描并行进程数 (128 核, 网络盘 I/O 密集, 用大值猛猛加速)
-SIM_WORKERS="${SIM_WORKERS:-16}"      # SIM 评估进程数 (每卡 4 个, 4 卡=16; 逐条计算不变, 填满 GPU)
+SIM_WORKERS="${SIM_WORKERS:-32}"      # SIM 评估进程数 (每卡 4 个, 8 卡=32; 逐条计算不变, 填满 GPU)
 SEED="${SEED:-42}"
 START_ROUND="${START_ROUND:-1}"
 START_STEP="${START_STEP:-clone}"
@@ -212,11 +220,47 @@ PYEOF
 }
 
 # ====================================================================
-#  Step 0: 检查并合并原音频目录
+#  Step 0: 生成说话人统计 (00_prepare_stats.py, 统计 audio 下所有数据集/说话人)
+#  只算源音频 (不带 --clone-dirs), 输出 source-only 的 all_speakers.csv
+# ====================================================================
+if [ "${RESUMING}" -eq 1 ]; then
+    log_step "STATS" "续跑模式: 跳过统计生成 (复用已有 STATS_CSV)"
+    if [ ! -f "${STATS_CSV}" ]; then
+        echo "❌ 续跑需要已有的 STATS_CSV, 但不存在: ${STATS_CSV}"
+        echo "   请先用 START_ROUND=1 START_STEP=clone 完整跑一次 (会自动生成统计)。"
+        exit 1
+    fi
+elif [ -f "${STATS_CSV}" ] && [ "${FORCE_STATS}" != "1" ]; then
+    log_step "STATS" "STATS_CSV 已存在, 跳过统计生成 (FORCE_STATS=1 可强制重算)"
+    echo "  ${STATS_CSV}"
+else
+    if [ -z "${STATS_SOURCE_DIRS}" ]; then
+        echo "❌ 需要生成统计, 但 STATS_SOURCE_DIRS / SOURCE_DIRS 均未设置"
+        echo "   请设置 SOURCE_DIRS (原始音频 audio 目录) 或 STATS_SOURCE_DIRS。"
+        exit 1
+    fi
+    log_step "STATS" "生成说话人统计 (source-only, target=${TARGET_SEC}s, workers=${SCAN_WORKERS})"
+    echo "  统计目录: ${STATS_SOURCE_DIRS}"
+    echo "  输出目录: ${STATS_OUTPUT_DIR}"
+    mkdir -p "${STATS_OUTPUT_DIR}"
+    run_or_fail "00_prepare_stats" \
+        "python3 ${V3_CLONE_DIR}/00_prepare_stats.py \
+            --source-dirs ${STATS_SOURCE_DIRS} \
+            --target-sec ${TARGET_SEC} \
+            --output-dir ${STATS_OUTPUT_DIR} \
+            --workers ${SCAN_WORKERS}"
+    # 00_prepare_stats.py 固定写 all_speakers.csv, 指向它作为下游 STATS_CSV
+    STATS_CSV="${STATS_OUTPUT_DIR}/all_speakers.csv"
+    echo "  → STATS_CSV=${STATS_CSV}"
+fi
+
+# ====================================================================
+#  Step 0b: 检查并合并原音频目录
 # ====================================================================
 if [ ! -f "${STATS_CSV}" ]; then
     echo "❌ STATS_CSV 不存在: ${STATS_CSV}"
-    echo "   请先运行(只算源音频, 不带 --clone-dirs): python3 v3_tts_clone/00_prepare_stats.py --source-dirs {audio} --target-sec ${TARGET_SEC} --output-dir <dir>"
+    echo "   Step 0 统计应已生成它; 若手动生成请运行(只算源音频, 不带 --clone-dirs):"
+    echo "   python3 v3_tts_clone/00_prepare_stats.py --source-dirs {audio} --target-sec ${TARGET_SEC} --output-dir <dir>"
     exit 1
 fi
 
@@ -340,26 +384,30 @@ for clone_root in clone_roots:
 
 # 读取原始 STATS_CSV, 调整 total_duration_sec
 rows = list(csv.DictReader(open(stats_csv, newline='')))
-fieldnames = list(rows[0].keys())
-adjusted_count = 0
-total_added_hours = 0.0
-with open(out_csv, 'w', newline='') as f:
-    w = csv.DictWriter(f, fieldnames=fieldnames)
-    w.writeheader()
-    for r in rows:
-        key = f'{r["dataset"]}/{r["speaker_id"]}'
-        extra_dur = clone_dur_map.get(key, 0.0)
-        if extra_dur > 0:
-            orig_dur = float(r['total_duration_sec'])
-            r['total_duration_sec'] = str(round(orig_dur + extra_dur, 2))
-            adjusted_count += 1
-            total_added_hours += extra_dur / 3600.0
-        w.writerow(r)
+if not rows:
+    print('  STATS_CSV 无数据行, 跳过 clone 时长调整')
+else:
+    fieldnames = list(rows[0].keys())
+    adjusted_count = 0
+    total_added_hours = 0.0
+    with open(out_csv, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            key = f'{r["dataset"]}/{r["speaker_id"]}'
+            extra_dur = clone_dur_map.get(key, 0.0)
+            if extra_dur > 0:
+                orig_dur = float(r['total_duration_sec'])
+                r['total_duration_sec'] = str(round(orig_dur + extra_dur, 2))
+                adjusted_count += 1
+                total_added_hours += extra_dur / 3600.0
+            w.writerow(r)
+
+    print(f'  total_duration_sec 已调整: {adjusted_count} 个说话人')
+    print(f'  累计增加 clone 时长: {total_added_hours:,.1f} 小时')
 
 print(f'  扫描 clone 目录: {len(clone_roots)} 个 ({clone_roots_str})')
 print(f'  找到有 clone 的说话人: {len(clone_dur_map)} 个')
-print(f'  total_duration_sec 已调整: {adjusted_count} 个说话人')
-print(f'  累计增加 clone 时长: {total_added_hours:,.1f} 小时')
 PYEOF2
 
 # Step 1b: 预算分配 (直接用原始 STATS_CSV; 04 自身扫描 --clone-root 计入 clone 时长, 避免双重计入)
@@ -465,8 +513,21 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
         nohup bash "${V3_CLONE_DIR}/03_launch_servers.sh" \
             "${GPU_LIST}" "${MODEL_PATH}" "${BASE_PORT}" \
             > "${PIPELINE_WORKDIR}/sglang_r${round}.log" 2>&1 &
+        # 健康检查全部 NUM_SERVERS 个端口 (base_port..base_port+N-1)。
+        # 03_tts_clone.py 只要有任一 server 不可达就 sys.exit(1) 且克隆步骤是致命的,
+        # 所以这里必须等所有 server 就绪, 避免慢启动的高号 GPU 杀掉整轮及后续轮次。
         for i in $(seq 1 30); do
-            if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${BASE_PORT}/health" 2>/dev/null)" = "200" ]; then break; fi
+            all_ready=1
+            for s in $(seq 0 $((NUM_SERVERS-1))); do
+                if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$((BASE_PORT+s))/health" 2>/dev/null)" != "200" ]; then
+                    all_ready=0
+                    break
+                fi
+            done
+            if [ "${all_ready}" -eq 1 ]; then
+                echo "  ✅ 全部 ${NUM_SERVERS} 个 TTS server 就绪"
+                break
+            fi
             sleep 10
         done
 
@@ -504,7 +565,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
     # ================= 2b: SIM 评估 + SIM 剪枝 (sim, level 2) =================
     # 先跑快的 SIM, 用 SIM 删一波 (缩小后面昂贵的 ASR/CER 工作量)
     if [ "${cur_start_level}" -le 2 ]; then
-        # 全部4卡, 每次全新 os.walk 扫描
+        # 全部 GPU (ALL_GPUS), 每次全新 os.walk 扫描
         run_or_fail "SIM 评估" \
             "bash ${EVAL_SIM_DIR}/run_eval_sim.sh \
                 --out-dir ${CLONE_ROOT} \
@@ -535,7 +596,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
 
     # ================= 2c: CER 评估 + CER 剪枝 (cer, level 3) =================
     if [ "${cur_start_level}" -le 3 ]; then
-        # 全部4卡, 强制刷新扫描缓存 (SIM 剪枝已删文件, 缓存必失效); 只评估 SIM 存活的 clone
+        # 全部 GPU (ALL_GPUS), 强制刷新扫描缓存 (SIM 剪枝已删文件, 缓存必失效); 只评估 SIM 存活的 clone
         # vllm 后端用连续批处理 (TP=卡数) 填满 GPU; batch 用较大的 ASR_VLLM_BATCH
         # 语言预分组对 transformers 有用(防子批变小), 对 vllm 收益小且要预扫全部 json → vllm 关掉
         if [ "${ASR_BACKEND}" = "vllm" ]; then

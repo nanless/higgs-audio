@@ -236,7 +236,7 @@ bash run_1m_gen.sh
 
 ## v3 TTS 声音复刻流水线（`v3_tts_clone/`）
 
-把总时长不足 1 小时（3600s）且音频 ≥20 条的说话人，通过 Higgs Audio v3 TTS 复刻到 1 小时水平。**当前主入口是 `05_iterative_pipeline.sh` 的 10 轮迭代流水线**（ASR → 预算分配 → 每轮 克隆→CER→SIM→剪枝）；旧的单次 `01/03/04` 顺序步骤已被整合为被 05 调用的子步骤。
+把总时长不足目标（`TARGET_SEC`，默认 3600s，**生产用 1800s** 半小时）且音频 ≥20 条的说话人，通过 Higgs Audio v3 TTS 复刻补齐。**当前主入口是 `05_iterative_pipeline.sh` 的 10 轮迭代流水线**（统计 → ASR → 预算分配 → 每轮 克隆→**SIM→CER**→剪枝，SIM 在前 CER 在后）；旧的单次 `01/03/04` 顺序步骤已被整合为被 05 调用的子步骤。
 
 > **注意**：`01_stats_speakers.py` 与 `03_run_post_prune_tmux.sh` 已删除，被 `00_prepare_stats.py` 和 `05_*` 系列取代。
 
@@ -245,7 +245,7 @@ bash run_1m_gen.sh
 ```
 v3_tts_clone/
 ├── README.md                       # 迭代克隆流水线详细文档
-├── 00_prepare_stats.py             # 生成全量说话人统计 (手动跑一次) → all_speakers.csv
+├── 00_prepare_stats.py             # 生成全量说话人统计 (Step 0 自动跑, source-only) → all_speakers.csv
 ├── 02_asr_launch.sh                # ASR 启动脚本 (被 05 调用)
 ├── 02_asr_worker.py                # ASR 转写 worker (Qwen3-ASR 1.7B, 每 GPU 一个)
 ├── 03_launch_servers.sh            # SGLang-Omni TTS 启动 (被 05 每轮启停)
@@ -273,37 +273,34 @@ v3_tts_clone/
 ### 运行主流水线
 
 ```bash
-# 1. 生成统计 (只跑一次) —— source-dirs 决定 speaker_path，clone-dirs 只计入已有时长
-python3 v3_tts_clone/00_prepare_stats.py \
-    --source-dirs /path/to/audio \
-    --clone-dirs /path/to/clone1 /path/to/clone2 \
-    --output-dir clone_workdir/stats_output --workers 32
-
-# 2. 编辑配置 (STATS_CSV / SOURCE_DIRS / CLONE_ROOT / NUM_SERVERS / ALL_GPUS 等)
+# 1. 编辑配置 (STATS_CSV / SOURCE_DIRS / CLONE_ROOT / NUM_SERVERS=8 / ALL_GPUS=0..7 等)
 #    见 v3_tts_clone/05_iterative_pipeline.env
+#    注意: 统计（00_prepare_stats.py）已作为 Step 0 自动运行, 无需手动跑
+#    （仅当想把旧 clone 时长也计入时才手动带 --clone-dirs, 但那会破坏 source-only 约定）
 
-# 3. 后台运行 (tmux session 名自定，README 用 higgs)
+# 2. 后台运行 (tmux session 名自定，README 用 higgs)
 source v3_tts_clone/05_iterative_pipeline.env
 tmux new-session -d -s higgs "bash v3_tts_clone/05_iterative_pipeline.sh"
-tail -f clone_workdir/iterative_pipeline/pipeline_*.log
+tail -f clone_workdir/iterative_pipeline*/pipeline_*.log
 ```
 
 ### 迭代流水线内部流程（`05_iterative_pipeline.sh`）
 
-1. **Step 0**：校验 `STATS_CSV` 存在；若 `SOURCE_DIRS` 有多个目录，用符号链接合并到 `merged_sources/`（参考音频只用原始音频，不用 clone）
-2. **Step 0.5a**：`02_asr_launch.sh` 转写源音频生成 transcript，然后 **`pkill -f 02_asr_worker` 释放 GPU** 给 TTS
-3. **Step 1a**：内联 Python 扫描 `CLONE_ROOT` 已有 clone 时长写入 `stats_with_clone_dur.csv`——**仅作信息展示**（04 会自己扫描 `CLONE_ROOT`，为避免 clone 时长双重计入，此 CSV 不再喂给 04）
-4. **Step 1b**：`04_post_prune_stats.py` 用**原始 `STATS_CSV`** + 自身扫描 `--clone-root` 的 clone 时长，按 gap 加权分配全局 `TOTAL_CLONE_HOURS` 预算 → `speaker_duration_stats_post_prune_resume.csv`
-5. **Step 1c**：`05_save_orig_allocation.py` 保存首轮 `clones_needed` / `start_clone_idx` 基准 JSON（**预算只分配一次，避免每轮漂移**）
-6. **Step 2 × N 轮**（默认 10）：
+1. **Step 0（统计，新增）**：非续跑模式下自动运行 `00_prepare_stats.py --source-dirs $STATS_SOURCE_DIRS(默认=SOURCE_DIRS) --target-sec $TARGET_SEC --output-dir $STATS_OUTPUT_DIR(默认=STATS_CSV 所在目录) --workers $SCAN_WORKERS`，统计 audio 下所有数据集/说话人生成 **source-only** 的 `all_speakers.csv`，并把 `STATS_CSV` 指向它。**已存在则跳过**（`FORCE_STATS=1` 强制重算）；续跑模式跳过并要求 `STATS_CSV` 存在
+2. **Step 0b**：校验 `STATS_CSV` 存在；若 `SOURCE_DIRS` 有多个目录，用符号链接合并到 `merged_sources/`（参考音频只用原始音频，不用 clone）
+3. **Step 0.5a**：`02_asr_launch.sh` 转写源音频生成 transcript，然后 **`pkill -f 02_asr_worker` 释放 GPU** 给 TTS
+4. **Step 1a**：内联 Python 扫描 `CLONE_ROOT` 已有 clone 时长写入 `stats_with_clone_dur.csv`——**仅作信息展示**（04 会自己扫描 `CLONE_ROOT`，为避免 clone 时长双重计入，此 CSV 不再喂给 04）
+5. **Step 1b**：`04_post_prune_stats.py` 用**原始 `STATS_CSV`** + 自身扫描 `--clone-root` 的 clone 时长，按 gap 加权分配全局 `TOTAL_CLONE_HOURS` 预算 → `speaker_duration_stats_post_prune_resume.csv`
+6. **Step 1c**：`05_save_orig_allocation.py` 保存首轮 `clones_needed` / `start_clone_idx` 基准 JSON（**预算只分配一次，避免每轮漂移**）
+7. **Step 2 × N 轮**（默认 10）：
    - 启动 TTS 服务（GPU `0..NUM_SERVERS-1`）+ 30 次 ×10s 健康检查
    - `05_scan_existing_clones.py` 扫描磁盘现有 clone 数
    - `05_generate_round_csv.py` 生成本轮 CSV：`clones_needed = min(ceil(原始/N), 原始-已有)`，`start_clone_idx = 基数+已有`
    - `03_tts_clone.py --post-prune --seed $((SEED + round*1000000))` 克隆（**每轮 seed 不同**，保证尾部被剪枝编号被复用时文本/参考仍不同；同轮内确定可续跑）
    - **`pkill -f "sgl-omni serve"` 停止 TTS 释放 GPU** 给评估
-   - **评估顺序 SIM 先、CER 后**（SIM 快，先删一波缩小昂贵的 ASR 量）：SIM 评估 → **`pkill -f eval_sim.py` 释放 GPU** → SIM 剪枝（`--max-cer 999` 只按 SIM<0.85 删）→ CER 评估（SIM 存活集；`--refresh-scan` 防缓存失效；`--batch-size 32 --audio-workers 16 --group-by-language --asr-max-new-tokens 512` 提速）→ **`pkill -f eval_cer.py` 释放 GPU** → CER 剪枝（CER>0.03 或 SIM<0.85）。两次剪枝均 `--eval-source sidecar`。`START_STEP` 级别：`clone=1<sim=2<cer=3`
+   - **评估顺序 SIM 先、CER 后**（SIM 快，先删一波缩小昂贵的 ASR 量）：SIM 评估 → **`pkill -f eval_sim.py` 释放 GPU** → SIM 剪枝（`--max-cer 999` 只按 SIM<`MIN_SIM`(0.8 raw 余弦) 删）→ CER 评估（SIM 存活集；`--refresh-scan` 防缓存失效；`--batch-size 32 --audio-workers 16 --group-by-language --asr-max-new-tokens 512` 提速）→ **`pkill -f eval_cer.py` 释放 GPU** → CER 剪枝（CER>0.03 或 SIM<0.8）。两次剪枝均 `--eval-source sidecar`。`START_STEP` 级别：`clone=1<sim=2<cer=3`
    - 失败的评估/剪枝只 warning，继续下一轮
-7. **最终**：`04_post_prune_stats.py` 最终统计 + `verify_kept_clones.py` 质量验证 + 各轮汇总
+8. **最终**：`04_post_prune_stats.py` 最终统计 + `verify_kept_clones.py` 质量验证 + 各轮汇总
 
 ### 关键设计（README「关键设计」表）
 
@@ -324,6 +321,7 @@ tail -f clone_workdir/iterative_pipeline/pipeline_*.log
 
 ### `00_prepare_stats.py` 细节
 
+- **由 `05_iterative_pipeline.sh` 的 Step 0 自动调用**（非续跑且 `STATS_CSV` 缺失/`FORCE_STATS=1` 时）；也可手动跑
 - `--source-dirs`：原始音频，`speaker_path` 取自此；`--clone-dirs`：复刻音频，时长计入 `clone_duration_sec` 但**不**用于 `speaker_path`
 - 遍历 `{root}/{dataset}/{speaker_id}/`；WAV 用 44 字节头快速算时长，非 WAV 用 `soundfile.info()`；`fsize <= 1000` 视为无效跳过
 - `_list_files()`：speaker 目录有子目录时改为 `os.walk` 递归；`SKIP_DIRS = {logs, __pycache__, ref, eval_sim_embedding_cache}`
@@ -346,10 +344,13 @@ tail -f clone_workdir/iterative_pipeline/pipeline_*.log
 - `--ref-mode`：`fixed`(每 speaker 一条) / `rotate`(每 N 条换一次) / `random`(每条独立，默认)
 - 每条 clone 用到的参考物化为 `ref/ref_{md5[:12]}.wav`，池元数据写 `ref/ref_pool.json`
 - transcript 来自源音频 sidecar `{audio_path}.json` 的 `transcript` 字段作为 `ref_text`
-- **`--post-prune`**：读 resume CSV，用预算分配的 `clones_needed` / `start_clone_idx`，跳过 `status==OK` 与 `clones_needed<=0`
+- **`--post-prune`**：读 resume CSV，用预算分配的 `clones_needed` / `start_clone_idx`，跳过 `status==OK` 与 `clones_needed<=0`。**注意**：`post_prune` 实际是 `args.post_prune or ("clone_duration_sec" in CSV 表头)`——round CSV 带该列时会自动进入 post-prune 分支，即使不传 `--post-prune`
+- ⚠️ **`start_clone_idx` 对输出文件名实际无效**：`clone_speaker()` 里 `file_start, _text_base = _resolve_clone_indices(out_dir, start_clone_idx)`，`file_start` 取自 `_next_clone_file_idx()`（磁盘现有最大 `clone_NNNN` +1），`_text_base` 未被使用。即输出编号纯粹磁盘续接，`start_clone_idx` 只影响那个被丢弃的 text_base——这正是「磁盘扫描替代 tracker」幂等的根源
+- **非 post-prune 路径**（旧单次模式）：`clones_net = int(gap/estimate)+1`，再 `clones_total = int(clones_net/quality_pass_rate)+1`（默认 2× buffer 补偿 50% 通过率）
+- 种子偏移：`pick_text` 用 `make_seed(uid, global_seed + clone_idx + 100003)`；`random` ref 用 `+ clone_idx + 200007`；`rotate` 用 `+ slot`；`fixed` 用 `+0`。每轮 `global_seed = SEED + round*1000000`
 - 生成的 clone WAV 默认从 TTS 的 24kHz **降采样到 16000 Hz**（`--output-sample-rate`，soxr_vhq）
 - 断点续跑：`clone_XXXX.wav` 存在且 `>1000 bytes` 且 `clone_XXXX.json` 存在 → 跳过
-- API 响应 <100 bytes 视为失败；健康检查失败 `sys.exit(1)`
+- API 响应 <100 bytes 视为失败；启动时对每个 server 逐一健康检查，任一不可达即 `sys.exit(1)`（05 pipeline 内的健康检查只轮询 `base_port` 首个 server，30×10s）
 - 种子确定性 `make_seed(uid, base) = int(md5(uid),16) % 100000 + base`；`--seed` 作为 `global_seed`
 
 #### 输出格式（新）
@@ -374,9 +375,10 @@ tail -f clone_workdir/iterative_pipeline/pipeline_*.log
 ### `04_post_prune_stats.py` 预算分配
 
 - 结合原始音频 + 已有 clone 时长，按每个 speaker 到 target 的 gap 比例分配全局 `--total-clone-hours`（`--target-duration-sec` 默认 3600，生产 1800；`--total-clone-hours` 生产 60000）
-- `clones_needed = allocated_clone_hours * 3600 / estimate_clone_duration`（默认每条 10s）
-- `status`：`COMPLETE` / `NEED_CLONE` / `INSUFFICIENT`（源数据 <20 条）
-- 输出 `speaker_duration_stats_post_prune_resume.csv` 可直接作为 `03_tts_clone.py --stats-csv --post-prune` 输入
+- `_process_row` 用 CSV 的 `total_duration_sec` 列当作 source 时长（所以 STATS_CSV 必须 source-only），再自身扫描 `--clone-root` 加上 clone 时长；`num_files<20` 直接返回 None（丢弃，不出现在输出）
+- `clones_needed = max(1, int(allocated_clone_sec / estimate_clone_duration) + 1)`（`estimate_clone_duration` 默认每条 10s）
+- `status`：只有 `OK`（gap≤0）/ `NEED_CLONE`（gap>0）两种；`num_files<20` 不产出行
+- 输出：`speaker_duration_stats_post_prune.csv`（全部）+ `speaker_duration_stats_post_prune_resume.csv`（仅 NEED_CLONE，作 `03_tts_clone.py --stats-csv --post-prune` 输入）+ summary json/txt
 - 快速 44 字节 WAV 头算时长
 
 ### `03_launch_servers.sh` 端口计算
@@ -387,15 +389,16 @@ tail -f clone_workdir/iterative_pipeline/pipeline_*.log
 
 ### 当前生产配置（`05_iterative_pipeline.env`）
 
-- `CLONE_ROOT`：`.../audio_higgs_audio_v3_tts_clone_3`（`clone_workdir/` 与 `*.wav` 已在 `.gitignore`，不要提交）
-- `NUM_SERVERS=4`，`ALL_GPUS=0,1,2,3`，`WORKERS_PER_SERVER=16`，`TOTAL_ROUNDS=10`，`TOTAL_CLONE_HOURS=10000`
-- `MAX_CER=0.03`，`MIN_SIM=0.8`（**raw 余弦**剪枝阈值），`TARGET_SEC=1800`（每说话人目标半小时，可配），`SEED=42`；八卡生产 `NUM_SERVERS=8 ALL_GPUS=0..7 SIM_WORKERS=32 TOTAL_CLONE_HOURS=60000 CLONE_ROOT=..._4`
-- `SIM_WORKERS=16`（SIM 评估进程数，每卡 4 个 × 4 卡）
+- `STATS_CSV`：`clone_workdir/stats_source_only/all_speakers.csv`（**source-only**，用 `00_prepare_stats.py --source-dirs {audio} --target-sec 1800` 生成，不带 `--clone-dirs`）
+- `CLONE_ROOT`：`.../audio_higgs_audio_v3_tts_clone_4`（全新目录从 0 生成）；`PIPELINE_WORKDIR`：`clone_workdir/iterative_pipeline_v4`（`clone_workdir/` 与 `*.wav` 已在 `.gitignore`，不要提交）
+- **八卡生产**：`NUM_SERVERS=8`，`ALL_GPUS=0..7`，`WORKERS_PER_SERVER=16`，`TOTAL_ROUNDS=10`，`TOTAL_CLONE_HOURS=60000`（raw0.8 存活 ~10% + 目标 0.5h → gross≈58.5k），`SCAN_WORKERS=64`，`SIM_WORKERS=32`（每卡 4×8 卡），`PRUNE_WORKERS=32`
+- `MAX_CER=0.03`，`MIN_SIM=0.8`（**raw 余弦**剪枝阈值），`TARGET_SEC=1800`（每说话人目标半小时，可配），`SEED=42`，`ESTIMATE_CLONE_DURATION=10`，`QUALITY_PASS_RATE=0.5`
+- **TTS 用 GPU `seq 0..NUM_SERVERS-1`**（与用于 ASR/评估的 `ALL_GPUS` 相互独立，可不同）
 - CER 提速：`ASR_BACKEND=vllm`（默认，vLLM 连续批处理、TP=卡数、GPU 利用率高；`transformers` 为回退）、`ASR_VLLM_BATCH=256`、`ASR_GPU_MEM_UTIL=0.9`、`ASR_AUDIO_WORKERS=16`、`ASR_MAX_NEW_TOKENS=512`、`ASR_BATCH_SIZE=32`（仅 transformers 用）。透传给 `run_eval_cer.sh` 的 `--asr-backend/--asr-gpu-mem-util/--batch-size/--audio-workers/--asr-max-new-tokens`。语言预分组：transformers 用 `--group-by-language`，**vllm 用 `--no-group-by-language`**（vllm 对混合语言不敏感，省掉全量 json 预扫）
 - **全盘扫描全部多进程（`SCAN_WORKERS=64`）**：`05_scan_existing_clones.py --workers`（重写为多进程，367k→~7s）、`eval_cer --scan-workers`（`list_clone_items` 改无-meta 并行扫，79s→~3s）、`prune_and_copy --scan-workers`（`scan_clone_wavs` 改按 speaker 分片，~0.5s）、`run_eval_sim.sh --scan-workers`（~20s，需读每条 json 取 ref）
 - `TTS_MAX_NEW_TOKENS=1024`（默认保持；即 `03_tts_clone.py --max-new-tokens`，SGLang audio-token 上限 ≈40.7s，长文本截断根因，需要时上调）
-- `set -u` 兼容：流水线脚本使用 `set -u`（未绑定变量报错），conda activate 前需要 `set +u` 绕过 binutils activate.d 的 `ADDR2LINE` 未绑定 bug
-- 日志：`clone_workdir/iterative_pipeline/pipeline_*.log`；各轮工件在 `round_NN/`
+- `set -u` 兼容：流水线脚本使用 `set -u`（未绑定变量报错），conda activate 前需要 `set +u` 绕过 binutils activate.d 的 `ADDR2LINE` 未绑定 bug（`run_eval_cer.sh`/`run_eval_sim.sh` 内部也各自 `set +u`/`set -u` 包裹 `conda activate`）
+- 日志：`clone_workdir/iterative_pipeline*/pipeline_*.log`；各轮工件在 `round_NN/`
 
 ### SGLang-Omni 本地安装
 
@@ -754,7 +757,7 @@ Sidecar 文件写在每个 clone 音频旁边：`clone_NNNN.cer.json`, `clone_NN
 | `prune_prev_clones.py` | **独立**筛选老 clone 目录到新质量线：读缓存 `.sim.json`(mapped)→`raw=2·sim-1`、`.cer.json`，删 `raw<0.8 或 cer>0.03`；GPU-free、默认 dry-run(`--execute` 才删) |
 | `analyze_distributions.py` | 读取 CER/SIM JSONL 明细，计算整体/按 dataset/按语言统计，CER-SIM 联合分布，剪枝 rule 预览，阈值矩阵 |
 | `verify_eval_consistency.py` | 验证 JSONL 汇总与 per-audio sidecar JSON 是否一致（多进程并行校验） |
-| `verify_kept_clones.py` | 验证磁盘上保留的 clone 均满足 KEEP 规则（CER ≤ 0.03 且 SIM ≥ 0.85），汇总总时长 |
+| `verify_kept_clones.py` | 验证磁盘上保留的 clone 均满足 KEEP 规则（CER ≤ `--max-cer`(默认 0.03) 且 SIM ≥ `--min-sim`(默认 0.8 raw)），汇总总时长；退出码非 0 表示有违规或磁盘数 > eval 预期 KEEP × 1.01 |
 | `run_analyze_distributions.sh` | 一键运行分布分析脚本 |
 
 默认阈值（`postprocess_common.py`）：`DEFAULT_MAX_CER = 0.03`、`DEFAULT_MIN_SIM = 0.8`（**raw 余弦**；旧 0.85 是 mapped=raw0.70）

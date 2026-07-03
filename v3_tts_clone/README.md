@@ -2,12 +2,12 @@
 
 ## 概述
 
-一键运行：ASR 转写 → 预算分配 → 10 轮迭代（每轮：启动 TTS → 克隆 1/10 → 停止 TTS → CER → SIM → 剪枝）。
+一键运行：统计说话人 → ASR 转写 → 预算分配 → 10 轮迭代（每轮：启动 TTS → 克隆 1/10 → 停止 TTS → SIM → CER → 剪枝）。
 
 ## 脚本
 
 ```
-00_prepare_stats.py            生成全量说话人统计 (手动运行一次)
+00_prepare_stats.py            生成全量说话人统计 (Step 0, 被 05 自动调用)
 02_asr_launch.sh / 02_asr_worker.py  ASR 转写 (被 05 调用)
 03_launch_servers.sh           SGLang TTS 启动 (被 05 调用, 每轮启停)
 03_tts_clone.py                TTS 克隆 (被 05 调用)
@@ -23,22 +23,22 @@
 
 ## 准备
 
-### 1. 生成统计 (只跑一次)
+### 1. 统计说话人 (Step 0, 流水线自动完成)
 
-```bash
-python3 v3_tts_clone/00_prepare_stats.py \
-    --source-dirs /root/group-shared/.../audio \
-    --clone-dirs \
-        /root/group-shared/.../audio_higgs_audio_v3_tts_clone \
-        /root/group-shared/.../audio_higgs_audio_v3_tts_clone_2 \
-        /root/group-shared/.../audio_omnivoice_clone \
-    --output-dir clone_workdir/stats_output \
-    --workers 32
-```
+**不需要手动跑**——`05_iterative_pipeline.sh` 的 Step 0 会自动运行 `00_prepare_stats.py`，
+统计 `SOURCE_DIRS`(audio 目录) 下**所有数据集/说话人**，生成 **source-only** 的
+`${STATS_OUTPUT_DIR}/all_speakers.csv`（默认写到 `STATS_CSV` 所在目录）。
+若 `STATS_CSV` 已存在则跳过；`FORCE_STATS=1` 可强制重算。
 
-- `--source-dirs`：原始音频。`speaker_path` 取自此。
-- `--clone-dirs`：复刻音频。时长计入 `clone_duration_sec`，不用于 `speaker_path`。
-- **输出文件名固定为 `{output-dir}/all_speakers.csv`**。下一步的 `STATS_CSV` 必须指向该文件（示例里的 `speaker_duration_stats_v2.csv` 是重命名后的路径——按需改名，或直接把 `STATS_CSV` 指向 `all_speakers.csv`）。
+> 只在需要把**以前的克隆时长**也计入统计时才手动跑并带 `--clone-dirs`（此时 STATS 不再是 source-only，
+> 与迭代流水线的 source-only 约定冲突，一般不用）：
+> ```bash
+> python3 v3_tts_clone/00_prepare_stats.py \
+>     --source-dirs /root/group-shared/.../audio \
+>     --target-sec 1800 \
+>     --output-dir clone_workdir/stats_source_only --workers 64
+> ```
+> - `--source-dirs`：原始音频，`speaker_path` 取自此。输出固定为 `{output-dir}/all_speakers.csv`。
 
 ### 2. 编辑配置
 
@@ -48,16 +48,18 @@ python3 v3_tts_clone/00_prepare_stats.py \
 REPO="/root/code/github_repos/higgs-audio"
 BASE="/root/group-shared/..."
 
-# STATS_CSV = 上一步 00 生成的 all_speakers.csv (或其重命名)
-export STATS_CSV="${REPO}/clone_workdir/speaker_duration_stats_v2.csv"
+# STATS_CSV: Step 0 自动生成的 source-only all_speakers.csv (已存在则复用)
+export STATS_CSV="${REPO}/clone_workdir/stats_source_only/all_speakers.csv"
 # TEXTS_JSONL = 克隆用的文本池 (每行一条 JSON, 含 text/clean_text)
 export TEXTS_JSONL="${REPO}/higgs_audio_v3_text_generator/batch_output_v2/generated_texts_final.jsonl"
-export SOURCE_DIRS="${BASE}/audio"
-export CLONE_ROOT="${BASE}/audio_higgs_audio_v3_tts_clone_3"
-export TOTAL_CLONE_HOURS=10000
+export SOURCE_DIRS="${BASE}/audio"                 # Step 0 统计此目录; 也是参考音频来源
+export CLONE_ROOT="${BASE}/audio_higgs_audio_v3_tts_clone_4"
+export TOTAL_CLONE_HOURS=60000
+export TARGET_SEC=1800
 export TOTAL_ROUNDS=10
-export NUM_SERVERS=4
-export ALL_GPUS="0,1,2,3"
+export NUM_SERVERS=8                                # 八卡机
+export ALL_GPUS="0,1,2,3,4,5,6,7"                  # ASR/评估用
+export SIM_WORKERS=32                               # 每卡 4 × 8 卡
 # 评估提速 / 长度控制
 export ASR_BATCH_SIZE=32
 export ASR_AUDIO_WORKERS=16
@@ -79,7 +81,8 @@ tmux new-session -d -s higgs "bash v3_tts_clone/05_iterative_pipeline.sh"
 ## 内部流程
 
 ```
-Step 0   检查 STATS_CSV, 合并参考音频目录
+Step 0    生成说话人统计 (00_prepare_stats.py, source-only; 已存在则跳过, FORCE_STATS=1 强制)
+Step 0b   检查 STATS_CSV, 合并参考音频目录
 Step 0.5a ASR 转写源音频 → 释放 GPU
 Step 1a   扫描 CLONE_ROOT 预存 clone
 Step 1b   预算分配 (04_post_prune_stats.py)
@@ -92,9 +95,9 @@ Step 2 × 10:
   ├ 克隆 (03_tts_clone.py --post-prune)
   ├ 停止 TTS → 释放 GPU
   ├ SIM 评估 (--skip-existing) → pkill eval_sim.py 释放 GPU
-  ├ SIM 剪枝 (只按 SIM<0.85 删一波, --max-cer 999 关闭 CER 判定; 缩小 CER 待评集)
+  ├ SIM 剪枝 (只按 SIM<0.8 删一波, --max-cer 999 关闭 CER 判定; 缩小 CER 待评集)
   ├ CER 评估 (SIM 存活集; --skip-existing --refresh-scan, batch/audio-workers/语言分组) → pkill eval_cer.py 释放 GPU
-  ├ CER 剪枝 (CER>0.03 或 SIM<0.85, 读 per-clone sidecar)
+  ├ CER 剪枝 (CER>0.03 或 SIM<0.8, 读 per-clone sidecar)
   └ 统计 (归档本轮 existing_clones_after.json)
 
 最终  04 最终统计 + verify_kept_clones.py 质量验证 + 各轮汇总

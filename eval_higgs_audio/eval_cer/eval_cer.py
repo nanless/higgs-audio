@@ -1044,8 +1044,22 @@ def build_eval_record(item: dict, evaluated_at: str, llm: bool = False, model_na
 
 
 def write_eval_json(json_path: Path, record: dict):
-    eval_path = json_path.with_suffix(".cer.json")
-    eval_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # Atomic write (tmp + os.replace) so a crash/OOM-kill mid-write cannot leave a
+    # corrupt .cer.json (which skip-existing/prune would then misread).
+    write_json(json_path.with_suffix(".cer.json"), record)
+
+
+def _cer_sidecar_valid(json_path: Path) -> bool:
+    """A clone counts as CER-evaluated only if its .cer.json exists AND parses.
+    A corrupt/half-written sidecar is treated as not-done so it gets re-evaluated."""
+    sidecar = json_path.with_suffix(".cer.json")
+    if not sidecar.exists():
+        return False
+    try:
+        json.loads(sidecar.read_text(encoding="utf-8"))
+        return True
+    except (json.JSONDecodeError, OSError):
+        return False
 
 
 def eval_paths(out_dir: Path) -> dict:
@@ -1226,7 +1240,7 @@ def main():
     if args.skip_existing:
         before = len(pairs)
         if args.skip_llm:
-            pairs = [(w, j) for w, j in pairs if not j.with_suffix(".cer.json").exists()]
+            pairs = [(w, j) for w, j in pairs if not _cer_sidecar_valid(j)]
         else:
             filtered = []
             for w, j in pairs:

@@ -36,7 +36,18 @@ def main():
         for path_key, cnt in raw.items():
             existing[path_key.replace("/", "__")] = cnt
 
-    full_rows = list(csv.DictReader(open(args.resume_csv, newline="")))
+    reader = csv.DictReader(open(args.resume_csv, newline=""))
+    full_rows = list(reader)
+    if not full_rows:
+        # resume CSV 只有表头(零 NEED_CLONE 行): 写出空的本轮 CSV(带表头)并返回,
+        # 让流水线的 has_clones 检查判定为 0 → 本轮无克隆, 不崩溃。
+        fieldnames = reader.fieldnames or []
+        with open(args.out_csv, "w", newline="") as f:
+            if fieldnames:
+                csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+        print("resume CSV 无数据行, 本轮无克隆任务")
+        print(f"输出: {args.out_csv}")
+        return
     fieldnames = list(full_rows[0].keys())
 
     use_merged = bool(args.merged_dir)

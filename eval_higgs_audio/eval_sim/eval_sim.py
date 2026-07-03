@@ -130,9 +130,22 @@ def find_clone_pairs(out_dir: Path, scan_workers: int = 32) -> List[Tuple[Path, 
 
 
 def write_sim_json(json_path: Path, record: dict):
-    json_path.with_suffix(".sim.json").write_text(
-        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    # Atomic write (tmp + os.replace) so a crash/OOM-kill mid-write cannot leave a
+    # corrupt .sim.json (which skip-existing/prune would then misread).
+    write_json(json_path.with_suffix(".sim.json"), record)
+
+
+def _sim_sidecar_done(json_path: Path) -> bool:
+    """A clone counts as SIM-evaluated only if its .sim.json exists AND parses.
+    A corrupt/half-written sidecar is treated as not-done so it gets re-evaluated."""
+    sidecar = json_path.with_suffix(".sim.json")
+    if not sidecar.exists():
+        return False
+    try:
+        json.loads(sidecar.read_text(encoding="utf-8"))
+        return True
+    except (json.JSONDecodeError, OSError):
+        return False
 
 
 def summarize(results: list) -> dict:
@@ -214,15 +227,25 @@ def _sim_worker(rank: int, gpu: str, shard: list, out_dir: str, model_dir: Path,
         ref_key = str(ref_audio)
         cached = ref_emb_cache.get(ref_key, _SENTINEL)
         if cached is _SENTINEL:
-            ref_emb = encoder.extract_embedding(ref_key)
+            try:
+                ref_emb = encoder.extract_embedding(ref_key)
+            except Exception as e:
+                print(f"[sim-w{rank}] ref embed failed, skip {ref_key}: {e}", flush=True)
+                ref_emb = None
             ref_emb_cache[ref_key] = ref_emb
         else:
             ref_emb = cached
-        clone_emb = encoder.extract_embedding(str(cloned_wav))
-        if ref_emb is not None and clone_emb is not None:
-            score = sim.cosine_similarity(ref_emb, clone_emb)
-        else:
-            score = None
+        if ref_emb is None:
+            # No sidecar written -> retried next round (implicit retry, like ASR worker).
+            continue
+        try:
+            clone_emb = encoder.extract_embedding(str(cloned_wav))
+        except Exception as e:
+            # A single corrupt clone WAV must not crash the worker (which would abort
+            # the whole round's SIM eval). Skip it; no sidecar -> retried next round.
+            print(f"[sim-w{rank}] clone embed failed, skip {cloned_wav}: {e}", flush=True)
+            continue
+        score = sim.cosine_similarity(ref_emb, clone_emb)
         record = {
             "cloned_audio": str(cloned_wav),
             "ref_audio": str(ref_audio),
@@ -300,7 +323,7 @@ def main():
 
     if args.skip_existing:
         before = len(pairs)
-        pairs = [(c, r, j) for c, r, j in pairs if not j.with_suffix(".sim.json").exists()]
+        pairs = [(c, r, j) for c, r, j in pairs if not _sim_sidecar_done(j)]
         print(f"Skip-existing: {before - len(pairs)} already done, {len(pairs)} remaining", flush=True)
         if not pairs:
             print("All pairs already evaluated.", flush=True)
