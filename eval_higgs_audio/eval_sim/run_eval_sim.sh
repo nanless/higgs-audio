@@ -21,7 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVAL_DIR="$(dirname "$SCRIPT_DIR")"
 
 eval "$(conda shell.bash hook)"
+# conda 环境的 activate.d 脚本(如 binutils)在 set -u 下会因未绑定变量(ADDR2LINE 等)报错, 临时关掉
+set +u
 conda activate omnivoice
+set -u
 
 cd "$SCRIPT_DIR"
 
