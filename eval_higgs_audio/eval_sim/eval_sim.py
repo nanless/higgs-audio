@@ -32,7 +32,7 @@ import random
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
@@ -111,7 +111,10 @@ def find_clone_pairs(out_dir: Path, scan_workers: int = 32) -> List[Tuple[Path, 
 
     raw: list[tuple] = []
     if len(speaker_dirs) > 1 and scan_workers > 1:
-        with ProcessPoolExecutor(max_workers=scan_workers) as executor:
+        # 线程池 (非进程池): 扫描是纯 I/O (scandir/open/json/isfile), 且本模块 import 时
+        # 已通过 speaker_similarity 加载 torch → fork 进程池会继承 torch/OpenMP 的线程锁,
+        # 概率性死锁 (worker 0 CPU futex 卡死, 主进程 write 阻塞)。线程池无 fork, 无此问题。
+        with ThreadPoolExecutor(max_workers=scan_workers) as executor:
             futs = {executor.submit(_fast_scan_speaker, sd): sd for sd in speaker_dirs}
             done = 0
             for fut in as_completed(futs):

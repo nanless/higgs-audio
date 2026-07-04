@@ -15,7 +15,7 @@ import json
 import os
 import re
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
 
@@ -204,7 +204,10 @@ def list_clone_items(out_dir: Path, label: str = "scan", scan_workers: int = 32)
     subdirs = _clone_speaker_subdirs(out_dir)
     items: List[Tuple[Path, Path]] = []
     if len(subdirs) > 1 and scan_workers > 1:
-        with ProcessPoolExecutor(max_workers=min(scan_workers, len(subdirs))) as ex:
+        # 线程池 (非进程池): 扫描纯 I/O (os.walk + isfile)。调用方 eval_cer.py 在 import 时
+        # 已加载 torch/vllm → fork 进程池会继承其线程锁, 概率性 fork-after-threads 死锁。
+        # 线程池无 fork, I/O 密集下并行度不减 (GIL 在系统调用时释放)。
+        with ThreadPoolExecutor(max_workers=min(scan_workers, len(subdirs))) as ex:
             for batch in ex.map(_scan_dir_pairs, subdirs, chunksize=16):
                 items.extend((Path(w), Path(j)) for w, j in batch)
     else:
