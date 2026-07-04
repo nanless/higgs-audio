@@ -26,6 +26,10 @@ echo ""
 
 echo "Cleaning stale sgl-omni processes..."
 pkill -f "sgl-omni serve" 2>/dev/null || true
+sleep 2
+# 同时清理 SGLang 的 multiprocessing spawn 引擎子进程 (命令行不含 "sgl-omni serve",
+# 单靠上面那句杀不掉, 会残留占满显存导致本轮 OOM)。higgs_v3_env 为 TTS 独占, 可整批杀。
+pkill -9 -f "${CONDA_PYTHON%/bin/python3}" 2>/dev/null || true
 sleep 3
 
 # Verify model exists

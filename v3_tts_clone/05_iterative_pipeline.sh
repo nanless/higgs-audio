@@ -219,6 +219,49 @@ if missing_all:
 PYEOF
 }
 
+# ---- GPU 进程清理工具 ----
+# 根因: SGLang / vLLM 用 multiprocessing.spawn 起的引擎子进程, 命令行是
+#   "<env>/bin/python3 -c from multiprocessing.spawn import spawn_main ..."
+# 里面不含 "sgl-omni serve" / "eval_*.py", 所以按主脚本名 pkill 杀不掉它们。
+# 主进程被杀后这些子进程被 init 收养 (PPID=1), 继续占满 GPU 显存。
+#
+# TTS 用 repo 内独占的 higgs_v3_env (本机没有别的任务用它) → 可整批清理。
+TTS_ENV_MARKER="${REPO_ROOT}/higgs_v3_env"
+stop_tts() {
+    pkill -f "sgl-omni serve" 2>/dev/null || true
+    sleep 2
+    # 关键: 按 env 路径整批杀掉 SGLang 的 spawn 引擎子进程 + resource_tracker
+    pkill -9 -f "${TTS_ENV_MARKER}" 2>/dev/null || true
+    # 轮询确认 higgs_v3_env 进程全部退出并释放显存 (最多 ~60s)
+    local _i
+    for _i in $(seq 1 20); do
+        if ! pgrep -f "${TTS_ENV_MARKER}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 3
+    done
+    sleep 2
+}
+
+# SIM/CER 用共享 conda env (omnivoice / qwen3-asr), 不能整批杀 (会误伤本机其他任务)。
+# 只回收 "孤儿" (PPID==1) 且命令行同时匹配 [该 env python] 与 [multiprocessing] 的残留 worker:
+# 这正是泄漏的 spawn/vllm 引擎子进程签名 (eval 主进程崩溃后被 init 收养), 不会误杀
+# 正常服务主进程 (其命令行无 multiprocessing spawn 标记)。-ww 避免 ps 截断长命令行。
+reap_orphans() {
+    local marker="$1"
+    local pids
+    pids=$(ps -eww -o pid=,ppid=,args= \
+        | awk -v m="${marker}" '$2==1 && index($0, m)>0 && index($0, "multiprocessing")>0 {print $1}' 2>/dev/null) || true
+    local p
+    for p in ${pids}; do
+        kill -9 "${p}" 2>/dev/null || true
+    done
+}
+
+# 安全网: 无论正常结束还是异常退出 (set -e / 健康检查超时 / 克隆失败), 都清理 TTS,
+# 防止 SGLang 引擎子进程残留占显存。正常收尾时无 TTS 运行, 为无害 no-op。
+trap 'stop_tts' EXIT
+
 # ====================================================================
 #  Step 0: 生成说话人统计 (00_prepare_stats.py, 统计 audio 下所有数据集/说话人)
 #  只算源音频 (不带 --clone-dirs), 输出 source-only 的 all_speakers.csv
@@ -291,9 +334,11 @@ else
     bash "${V3_CLONE_DIR}/02_asr_launch.sh" "${ALL_GPUS}" "${STATS_CSV}" "${TARGET_SEC}"
     echo "  ✅ ASR 转写完成"
 
-    # 释放 GPU 显存: 杀掉 ASR worker 进程, 防止影响后续 TTS
+    # 释放 GPU 显存: 杀掉 ASR worker 进程 + 回收孤儿 (qwen3-asr env), 防止影响后续 TTS
     pkill -f "02_asr_worker" 2>/dev/null || true
-    sleep 5
+    sleep 2
+    reap_orphans "qwen3-asr/bin/python"
+    sleep 3
     echo "  ✅ ASR 进程已释放 GPU"
 fi
 
@@ -530,6 +575,9 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
             fi
             sleep 10
         done
+        if [ "${all_ready}" -ne 1 ]; then
+            echo "  ⚠️  健康检查超时 (300s): 仍有 TTS server 未就绪; 克隆步骤会自检并可能致命失败 (EXIT trap 会清理 TTS)"
+        fi
 
         # 每轮 seed 不同 (round * 1000000 偏移, 远大于单说话人 clone 数, 避免与 clone_idx 混叠):
         # 即使尾部被剪枝的编号在下一轮被复用, 文本/参考也会不同; 同一轮内仍确定, 支持断点续跑。
@@ -548,10 +596,8 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --estimate-clone-duration ${ESTIMATE_CLONE_DURATION} \
                 --quality-pass-rate ${QUALITY_PASS_RATE}"
 
-        pkill -f "sgl-omni serve" 2>/dev/null || true
-        sleep 5
-        echo "  ✅ TTS 已停止, GPU 释放"
-        sleep 5
+        stop_tts
+        echo "  ✅ TTS 已停止 (含 spawn 引擎子进程), GPU 释放"
 
         # 保存本轮克隆摘要 (clone_summary.json 会被每轮覆盖, 这里归档)
         CLONE_SUMMARY="${CLONE_ROOT}/clone_summary.json"
@@ -574,9 +620,11 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --scan-workers ${SCAN_WORKERS} \
                 --workers ${SIM_WORKERS}" || echo "⚠️  SIM 评估失败，跳过 SIM 剪枝，继续 CER"
 
-        # 释放 SIM 占用的 GPU, 防止残留 (含 spawn worker) 影响后续 CER/TTS
+        # 释放 SIM 占用的 GPU: 杀主进程 + 回收孤儿 spawn worker (omnivoice env)
         pkill -f "eval_sim.py" 2>/dev/null || true
-        sleep 5
+        sleep 2
+        reap_orphans "omnivoice/bin/python"
+        sleep 3
         echo "  ✅ SIM 评估进程已释放 GPU"
 
         # SIM 剪枝: 只按 SIM 删 (--max-cer 999 关闭 CER 判定), 缩小 CER 待评估集
@@ -620,9 +668,11 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --asr-max-new-tokens ${ASR_MAX_NEW_TOKENS} \
                 ${LANG_GROUP_ARG}" || echo "⚠️  CER 评估失败，跳过 CER 剪枝，继续下一轮"
 
-        # 释放 CER (ASR) 占用的 GPU
+        # 释放 CER (ASR) 占用的 GPU: 杀主进程 + 回收孤儿 vllm/spawn worker (qwen3-asr env)
         pkill -f "eval_cer.py" 2>/dev/null || true
-        sleep 5
+        sleep 2
+        reap_orphans "qwen3-asr/bin/python"
+        sleep 3
         echo "  ✅ CER 评估进程已释放 GPU"
 
         # CER 剪枝: 完整阈值 (SIM 存活里再删 CER>${MAX_CER}; SIM 已合格)
