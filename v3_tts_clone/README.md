@@ -17,6 +17,9 @@
 05_save_orig_allocation.py     保存分配基准
 05_iterative_pipeline.sh       主流水线 (包含 ASR + TTS + 10 轮迭代)
 05_iterative_pipeline.env      配置
+06_filter_copy_by_sim.py       按 raw SIM 阈值过滤并拷贝老 clone 目录 (合并/去重名, 见下文)
+07_topup_pipeline.sh           补齐(top-up)流水线启动器: 把已有过滤 clone 计入 baseline (见下文)
+07_topup_pipeline.env          07 的配置 (源=audio, 统计口径含已过滤 clone 目录)
 ```
 
 ---
@@ -132,6 +135,53 @@ Step 2 × 10:
 ```bash
 python eval_higgs_audio/prune_prev_clones.py --dirs /…/audio_omnivoice_clone /…/_clone /…/_clone_2 /…/_clone_3   # 预览
 python eval_higgs_audio/prune_prev_clones.py --dirs … --execute                                                  # 真删
+```
+
+## 老 clone 目录过滤+拷贝 (`06_filter_copy_by_sim.py`)
+
+与 `prune_prev_clones.py`「原地删除」不同，此工具**不动源目录**，把满足 `raw 余弦 > 0.8`
+的 clone **拷贝**到新目录（wav + 全部 sidecar），用于产出一份干净的高相似度子集。
+
+- **过滤**：`raw = 2·mapped − 1 > 0.8`（老目录 `.sim.json` 存的是 mapped=(cos+1)/2；缺 `.sim.json`/`similarity` 的直接跳过）。GPU-free，无需参考文件。
+- **合并去重名**：多个源目录若有相同 `{dataset}/{speaker}/clone_NNNN` 名，给每个源加**自己的文件名前缀**（默认 `c1_/c2_/c3_`）拷进**同一个**目标目录，互不覆盖；单一源（omnivoice）不加前缀、保留原名。
+- **保留子目录结构**：目标为 `{dest}/{dataset}/{speaker}/{前缀}{原文件名}.{wav,json,sim.json,cer.json,...}`，与源结构一致。
+- **`.sim.json` 追加 raw**：拷贝时写入 `similarity_raw`(原始余弦)、`similarity_mapped`(=原 `similarity`)、`similarity_scale_note`；原 `similarity` 字段保持不变。sidecar 内部的 `cloned_audio`/`wav_path` 等路径**不改写**（仍指向源）。
+- 默认 **dry-run**（只统计不拷）；`--execute` 真拷。多进程（`--workers`，默认 32）按 speaker 单元并行。报告写到 `v3_tts_clone/filter_copy_report/`。
+
+```bash
+# 预览（默认 jobs 已写死为 higgs _clone/_2/_3 → _123_sim0.8_filtered, omnivoice → _sim0.8_filtered）
+python v3_tts_clone/06_filter_copy_by_sim.py --workers 48
+# 真拷
+python v3_tts_clone/06_filter_copy_by_sim.py --workers 48 --execute
+# 自定义 (SRC:DEST:PREFIX 每个 job, prefix 可省)
+python v3_tts_clone/06_filter_copy_by_sim.py --jobs /a:/merged:a_ /b:/merged:b_ --min-sim-raw 0.8 --execute
+```
+
+> 大规模建议放 tmux：`tmux new-session -d -s filtercopy "python v3_tts_clone/06_filter_copy_by_sim.py --workers 48 --execute > v3_tts_clone/filter_copy_report/execute.log 2>&1"`
+
+## 补齐(top-up)流水线 (`07_topup_pipeline.sh` + `.env`)
+
+在**已有一批过滤后 clone** 的基础上继续把说话人补齐到目标时长的场景。与 `05` 的**唯一区别是源目录与统计口径**——它复用 `05` 的全部核心逻辑 (ASR → 预算分配 → 10 轮 克隆→SIM→CER→剪枝)。
+
+**核心差异 (口径)**：
+- **统计"总时长"** = 原始 `audio` + 若干**已过滤 clone 目录** (如 `audio_higgs_audio_v3_tts_clone_123_sim0.8_filtered`、`audio_omnivoice_clone_sim0.8_filtered`)。靠 `00_prepare_stats.py --clone-dirs` 把这些目录时长计入 `total_duration_sec`。
+- **参考音频 (ref) 只用 `audio`**：`speaker_path` 由 `--source-dirs` 决定 (只 audio)，每轮 `05_generate_round_csv.py --merged-dir` 也把 `speaker_path` 覆盖为 `SOURCE_DIRS=audio`。
+- **只补齐 total < 目标 的说话人**，新 clone 只写入**全新的** `CLONE_ROOT` (如 `..._clone_5`)，不动作为 baseline 的已过滤目录 (它们不是 `--clone-root`，`04` 不会重复计入)。
+- **SIM/CER 剪枝阈值与 05 完全一致** (`MAX_CER=0.03`, `MIN_SIM=0.8` raw)。
+
+**实现要点**：
+- `05_iterative_pipeline.sh` Step 0 新增可选环境变量 `STATS_CLONE_DIRS`（留空 = source-only，即 05 默认行为；设置后额外 `--clone-dirs`）。完全向后兼容。
+- `07_topup_pipeline.sh` 启动器：先跑 Step 0 统计 (source + clone-dirs) 测出 `gap_hours`，按 `TOTAL_CLONE_HOURS = ceil(gap_hours / SURVIVAL_EST)` 自动定预算 (默认 `SURVIVAL_EST=0.1` 保守；实测存活率更高可上调以省算力/磁盘)，再 `exec` `05_iterative_pipeline.sh` (它见 `STATS_CSV` 已存在会跳过重复统计)。手动设 `TOTAL_CLONE_HOURS` 则跳过自动测算；续跑模式 (`START_ROUND>1`/`START_STEP!=clone`) 跳过测算并复用已有分配基准。
+
+```bash
+# 编辑 07_topup_pipeline.env (源目录 / 已过滤 clone 目录 / CLONE_ROOT / 预算等), 然后:
+tmux new-session -d -s higgs_v5 "bash v3_tts_clone/07_topup_pipeline.sh"
+tail -f clone_workdir/iterative_pipeline_v5/pipeline_*.log
+
+# 省算力: 按实测存活率把预算调高存活率 (少生成)
+SURVIVAL_EST=0.4 bash v3_tts_clone/07_topup_pipeline.sh
+# 或直接手动指定预算 (跳过自动测算)
+TOTAL_CLONE_HOURS=12000 bash v3_tts_clone/07_topup_pipeline.sh
 ```
 
 ## 评估提速 (CER)

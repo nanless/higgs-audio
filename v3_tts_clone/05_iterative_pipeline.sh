@@ -14,8 +14,9 @@
 #   source v3_tts_clone/05_iterative_pipeline.env && bash v3_tts_clone/05_iterative_pipeline.sh
 #
 # 环境变量 (可选, 有默认值):
-#   STATS_CSV          — speaker_duration_stats.csv (Step 0 自动生成, source-only)
+#   STATS_CSV          — speaker_duration_stats.csv (Step 0 自动生成)
 #   STATS_SOURCE_DIRS  — Step 0 要统计的原始音频目录 (默认 = SOURCE_DIRS)
+#   STATS_CLONE_DIRS   — 可选: 额外计入时长的已有 clone 目录 (仅时长, 参考仍只用 source; 默认空 = source-only)
 #   STATS_OUTPUT_DIR   — Step 0 统计输出目录 (默认 = STATS_CSV 所在目录, 写 all_speakers.csv)
 #   FORCE_STATS        — 1 = 即使 STATS_CSV 已存在也强制重新统计 (默认 0)
 #   TEXTS_JSONL        — 文本池 JSONL
@@ -55,6 +56,9 @@ SOURCE_DIRS="${SOURCE_DIRS:-}"
 MERGED_SOURCES_DIR="${PIPELINE_WORKDIR}/merged_sources"
 # Step 0 统计: 要统计的原始音频目录 (默认 = SOURCE_DIRS), 输出目录 (默认 = STATS_CSV 所在目录)
 STATS_SOURCE_DIRS="${STATS_SOURCE_DIRS:-${SOURCE_DIRS}}"
+# 可选: 额外把已有 clone 目录的时长计入 total_duration_sec (仅统计时长, speaker_path/参考音频仍只取自 source)。
+# 留空 = source-only (05 默认行为)。07_topup_pipeline 用它把两个已过滤 clone 目录当作 baseline。
+STATS_CLONE_DIRS="${STATS_CLONE_DIRS:-}"
 STATS_OUTPUT_DIR="${STATS_OUTPUT_DIR:-$(dirname "${STATS_CSV}")}"
 FORCE_STATS="${FORCE_STATS:-0}"   # 1 = 即使 STATS_CSV 已存在也强制重新统计
 TOTAL_CLONE_HOURS="${TOTAL_CLONE_HOURS:-10000}"
@@ -264,7 +268,8 @@ trap 'stop_tts' EXIT
 
 # ====================================================================
 #  Step 0: 生成说话人统计 (00_prepare_stats.py, 统计 audio 下所有数据集/说话人)
-#  只算源音频 (不带 --clone-dirs), 输出 source-only 的 all_speakers.csv
+#  默认只算源音频 (source-only)。若设置 STATS_CLONE_DIRS, 则额外把这些 clone 目录
+#  时长计入 total_duration_sec (speaker_path/参考音频仍只取自 source)。
 # ====================================================================
 if [ "${RESUMING}" -eq 1 ]; then
     log_step "STATS" "续跑模式: 跳过统计生成 (复用已有 STATS_CSV)"
@@ -282,13 +287,21 @@ else
         echo "   请设置 SOURCE_DIRS (原始音频 audio 目录) 或 STATS_SOURCE_DIRS。"
         exit 1
     fi
-    log_step "STATS" "生成说话人统计 (source-only, target=${TARGET_SEC}s, workers=${SCAN_WORKERS})"
-    echo "  统计目录: ${STATS_SOURCE_DIRS}"
+    log_step "STATS" "生成说话人统计 (target=${TARGET_SEC}s, workers=${SCAN_WORKERS})"
+    echo "  统计目录 (source): ${STATS_SOURCE_DIRS}"
+    STATS_CLONE_ARG=""
+    if [ -n "${STATS_CLONE_DIRS}" ]; then
+        STATS_CLONE_ARG="--clone-dirs ${STATS_CLONE_DIRS}"
+        echo "  额外计入 clone 目录时长 (仅时长, 不作参考): ${STATS_CLONE_DIRS}"
+    else
+        echo "  (source-only, 未设置 STATS_CLONE_DIRS)"
+    fi
     echo "  输出目录: ${STATS_OUTPUT_DIR}"
     mkdir -p "${STATS_OUTPUT_DIR}"
     run_or_fail "00_prepare_stats" \
         "python3 ${V3_CLONE_DIR}/00_prepare_stats.py \
             --source-dirs ${STATS_SOURCE_DIRS} \
+            ${STATS_CLONE_ARG} \
             --target-sec ${TARGET_SEC} \
             --output-dir ${STATS_OUTPUT_DIR} \
             --workers ${SCAN_WORKERS}"

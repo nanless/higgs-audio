@@ -28,7 +28,7 @@
 - 核心模块在 `boson_multimodal/` 下，安装后即为顶级 Python 包
 - `setup.cfg` 排除 `tests*` 和 `training*` 目录
 - `boson_multimodal/__init__.py` 是**空文件**
-- 根目录 `README.md` 现在是 v3 入口页面，v2/v2.5 文档已移至 `README_V2.md`，v3 详细文档在 `README_V3.md`
+- 根目录 `README.md` 是**单一合并文档**（原 `README_V2.md` / `README_V3.md` 已删除，内容整合进 `README.md`）：涵盖仓库全景、v3 使用（API/SGLang/HF）、v2/v2.5 使用、核心包架构、以及仓库内 v3 工具链（文本生成/复刻/评估）导读
 - 贡献和支持指南：`SUPPORT_GUIDELINES.md`
 - 技术博客：`tech_blogs/ARCHITECTURE_BLOG.md`（DualFFN 架构）、`tech_blogs/TOKENIZER_BLOG.md`（25fps audio tokenizer）
 - **重要 `.gitignore` 模式**：`clone_workdir/`（v3 声音复刻工作目录）、`*.wav`（生成的音频）、`*.jsonl`（数据集文件）、`higgs_audio_v3_text_generator/batch_output/`、`child_voice_clone_output_higgs`——这些不被跟踪，不要提交
