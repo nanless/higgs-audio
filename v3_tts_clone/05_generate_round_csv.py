@@ -20,7 +20,7 @@ import argparse, csv, json, math, os
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--orig-json", required=True, help="01 分配的原始 clones_needed")
+    p.add_argument("--orig-json", required=True, help="04 分配的原始 clones_needed")
     p.add_argument("--existing-json", required=True, help="scan_existing_clones 的输出")
     p.add_argument("--resume-csv", required=True, help="04_post_prune_stats 生成的 resume CSV")
     p.add_argument("--merged-dir", default="", help="合并后的原音频目录 (为空则不覆盖 speaker_path)")
@@ -71,6 +71,7 @@ def main():
             per_round = max(1, math.ceil(full_needed / args.total_rounds))
             this_round = min(per_round, still_need)
             r["clones_needed"] = str(this_round)
+            # Compatibility only: 03_tts_clone filenames use disk _next_clone_file_idx, not this field.
             r["start_clone_idx"] = str(orig[uid]["start_clone_idx"] + already)
             total += this_round
             w.writerow(r)

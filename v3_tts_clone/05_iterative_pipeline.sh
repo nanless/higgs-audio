@@ -42,6 +42,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 V3_CLONE_DIR="${REPO_ROOT}/v3_tts_clone"
+# Auto-source 05 env only when caller did not set SOURCE_DIRS/CLONE_ROOT (07 already sources its env).
+if [ -z "${SOURCE_DIRS:-}" ] && [ -z "${CLONE_ROOT:-}" ] && [ -f "${V3_CLONE_DIR}/05_iterative_pipeline.env" ]; then
+    # shellcheck disable=SC1091
+    source "${V3_CLONE_DIR}/05_iterative_pipeline.env"
+fi
 EVAL_CER_DIR="${REPO_ROOT}/eval_higgs_audio/eval_cer"
 EVAL_SIM_DIR="${REPO_ROOT}/eval_higgs_audio/eval_sim"
 EVAL_DIR="${REPO_ROOT}/eval_higgs_audio"
@@ -118,6 +123,48 @@ if [ "${START_ROUND}" -gt 1 ] || [ "${START_STEP_LEVEL}" -gt 1 ]; then
 else
     echo "▶ 全新运行: 从第 1 轮 clone 开始"
 fi
+echo ""
+
+# ---- 预检 ----
+MIN_FREE_GB="${MIN_FREE_GB:-500}"
+PIPELINE_FAILED=0
+preflight_ok=1
+if [ ! -f "${TEXTS_JSONL}" ]; then
+    echo "❌ TEXTS_JSONL 不存在: ${TEXTS_JSONL}"; preflight_ok=0
+elif [ ! -s "${TEXTS_JSONL}" ]; then
+    echo "❌ TEXTS_JSONL 为空: ${TEXTS_JSONL}"; preflight_ok=0
+fi
+mkdir -p "${CLONE_ROOT}" "${PIPELINE_WORKDIR}" || { echo "❌ 无法创建 CLONE_ROOT/PIPELINE_WORKDIR"; preflight_ok=0; }
+if ! touch "${CLONE_ROOT}/.write_test" 2>/dev/null; then
+    echo "❌ CLONE_ROOT 不可写: ${CLONE_ROOT}"; preflight_ok=0
+else
+    rm -f "${CLONE_ROOT}/.write_test"
+fi
+if command -v df >/dev/null 2>&1; then
+    free_gb=$(df -BG --output=avail "${CLONE_ROOT}" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
+    if [ -n "${free_gb}" ] && [ "${free_gb}" -lt "${MIN_FREE_GB}" ]; then
+        echo "❌ 磁盘可用 ${free_gb}GB < MIN_FREE_GB=${MIN_FREE_GB} (${CLONE_ROOT})"
+        preflight_ok=0
+    else
+        echo "✓ 磁盘可用约 ${free_gb:-?}GB (阈值 ${MIN_FREE_GB}GB)"
+    fi
+fi
+if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_n=$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${gpu_n}" -lt "${NUM_SERVERS}" ]; then
+        echo "❌ 可见 GPU=${gpu_n} < NUM_SERVERS=${NUM_SERVERS}"
+        preflight_ok=0
+    else
+        echo "✓ GPU 可见 ${gpu_n} 张 (NUM_SERVERS=${NUM_SERVERS})"
+    fi
+else
+    echo "⚠️  nvidia-smi 不可用, 跳过 GPU 数量预检"
+fi
+if [ "${preflight_ok}" -ne 1 ]; then
+    echo "❌ 预检失败, 退出"
+    exit 1
+fi
+echo "✓ 预检通过"
 echo ""
 
 # ---- 工具函数 ----
@@ -279,8 +326,43 @@ if [ "${RESUMING}" -eq 1 ]; then
         exit 1
     fi
 elif [ -f "${STATS_CSV}" ] && [ "${FORCE_STATS}" != "1" ]; then
-    log_step "STATS" "STATS_CSV 已存在, 跳过统计生成 (FORCE_STATS=1 可强制重算)"
-    echo "  ${STATS_CSV}"
+    SUMMARY_JSON="${STATS_OUTPUT_DIR}/summary.json"
+    need_restat=0
+    if [ -f "${SUMMARY_JSON}" ]; then
+        if ! STATS_CLONE_DIRS="${STATS_CLONE_DIRS}" SUMMARY_JSON="${SUMMARY_JSON}" python3 - <<'PY'
+import json, os, sys
+want = sorted(x for x in os.environ.get("STATS_CLONE_DIRS", "").split() if x)
+have = sorted(json.load(open(os.environ["SUMMARY_JSON"])).get("clone_dirs") or [])
+sys.exit(0 if want == have else 1)
+PY
+        then
+            echo "⚠️  STATS_CLONE_DIRS 与 ${SUMMARY_JSON} 中 clone_dirs 不一致 → 自动重算统计"
+            need_restat=1
+        fi
+    fi
+    if [ "${need_restat}" -eq 0 ]; then
+        log_step "STATS" "STATS_CSV 已存在, 跳过统计生成 (FORCE_STATS=1 可强制重算)"
+        echo "  ${STATS_CSV}"
+    else
+        if [ -z "${STATS_SOURCE_DIRS}" ]; then
+            echo "❌ 需要重算统计, 但 STATS_SOURCE_DIRS / SOURCE_DIRS 均未设置"
+            exit 1
+        fi
+        log_step "STATS" "因口径变化重新生成说话人统计 (target=${TARGET_SEC}s, workers=${SCAN_WORKERS})"
+        echo "  统计目录 (source): ${STATS_SOURCE_DIRS}"
+        STATS_CLONE_ARG=""
+        if [ -n "${STATS_CLONE_DIRS}" ]; then
+            STATS_CLONE_ARG="--clone-dirs ${STATS_CLONE_DIRS}"
+            echo "  额外计入 clone 目录时长 (仅时长, 不作参考): ${STATS_CLONE_DIRS}"
+        else
+            echo "  (source-only, 未设置 STATS_CLONE_DIRS)"
+        fi
+        echo "  输出目录: ${STATS_OUTPUT_DIR}"
+        mkdir -p "${STATS_OUTPUT_DIR}"
+        run_or_fail "00_prepare_stats"             "python3 ${V3_CLONE_DIR}/00_prepare_stats.py                 --source-dirs ${STATS_SOURCE_DIRS}                 ${STATS_CLONE_ARG}                 --target-sec ${TARGET_SEC}                 --output-dir ${STATS_OUTPUT_DIR}                 --workers ${SCAN_WORKERS}"
+        STATS_CSV="${STATS_OUTPUT_DIR}/all_speakers.csv"
+        echo "  → STATS_CSV=${STATS_CSV}"
+    fi
 else
     if [ -z "${STATS_SOURCE_DIRS}" ]; then
         echo "❌ 需要生成统计, 但 STATS_SOURCE_DIRS / SOURCE_DIRS 均未设置"
@@ -376,97 +458,7 @@ if [ "${RESUMING}" -eq 1 ]; then
     fi
 else
 
-# Step 1a: 扫描 CLONE_ROOT 预存 clone (仅用于日志展示已有 clone 时长)
-# 注意: 04_post_prune_stats.py 会自己重新扫描 CLONE_ROOT 计入 clone 时长,
-#       因此这里生成的 ADJUSTED_STATS_CSV 不再喂给 04 (否则 clone 时长会被双重计入)。
-#       旧 clone 目录 (--clone-dirs) 的时长已由 00_prepare_stats.py 纳入 total_duration_sec。
-log_step "DUR" "扫描 CLONE_ROOT 预存 clone (信息展示)"
-ADJUSTED_STATS_CSV="${ALLOC_DIR}/stats_with_clone_dur.csv"
-export _PIPE_STATS_CSV="${STATS_CSV}"
-export _PIPE_CLONE_ROOTS="${CLONE_ROOT}"
-export _PIPE_OUT_CSV="${ADJUSTED_STATS_CSV}"
-python << 'PYEOF2'
-import os, csv, struct, re, sys
-
-stats_csv = os.environ.get('_PIPE_STATS_CSV', '')
-clone_roots_str = os.environ.get('_PIPE_CLONE_ROOTS', '')
-out_csv = os.environ.get('_PIPE_OUT_CSV', '')
-clone_roots = [d for d in clone_roots_str.split() if d and os.path.isdir(d)]
-
-CLONE_WAV_RE = re.compile(r'^clone_(\d+)\.wav$')
-
-# 扫描所有 clone root, 计算每个说话人的 clone 总时长
-# key: dataset/speaker_id → total_clone_dur_sec
-clone_dur_map = {}
-for clone_root in clone_roots:
-    if not os.path.isdir(clone_root):
-        continue
-    for dataset in os.listdir(clone_root):
-        ds_path = os.path.join(clone_root, dataset)
-        if not os.path.isdir(ds_path):
-            continue
-        for speaker_id in os.listdir(ds_path):
-            spk_path = os.path.join(ds_path, speaker_id)
-            if not os.path.isdir(spk_path):
-                continue
-            total_dur = 0.0
-            try:
-                for fname in os.listdir(spk_path):
-                    m = CLONE_WAV_RE.match(fname)
-                    if not m:
-                        continue
-                    fpath = os.path.join(spk_path, fname)
-                    try:
-                        fsize = os.path.getsize(fpath)
-                    except OSError:
-                        continue
-                    if fsize <= 1000:
-                        continue
-                    # 快速 WAV 时长计算 (44 bytes header)
-                    try:
-                        with open(fpath, 'rb') as wf:
-                            hdr = wf.read(44)
-                        if len(hdr) >= 44 and hdr[:4] == b'RIFF':
-                            ch = struct.unpack_from('<H', hdr, 22)[0]
-                            sr = struct.unpack_from('<I', hdr, 24)[0]
-                            bps = struct.unpack_from('<H', hdr, 34)[0]
-                            if sr > 0 and bps > 0 and ch > 0:
-                                total_dur += (fsize - 44) / (sr * ch * (bps / 8))
-                    except Exception:
-                        pass
-            except OSError:
-                pass
-            if total_dur > 0:
-                key = f'{dataset}/{speaker_id}'
-                clone_dur_map[key] = clone_dur_map.get(key, 0.0) + total_dur
-
-# 读取原始 STATS_CSV, 调整 total_duration_sec
-rows = list(csv.DictReader(open(stats_csv, newline='')))
-if not rows:
-    print('  STATS_CSV 无数据行, 跳过 clone 时长调整')
-else:
-    fieldnames = list(rows[0].keys())
-    adjusted_count = 0
-    total_added_hours = 0.0
-    with open(out_csv, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            key = f'{r["dataset"]}/{r["speaker_id"]}'
-            extra_dur = clone_dur_map.get(key, 0.0)
-            if extra_dur > 0:
-                orig_dur = float(r['total_duration_sec'])
-                r['total_duration_sec'] = str(round(orig_dur + extra_dur, 2))
-                adjusted_count += 1
-                total_added_hours += extra_dur / 3600.0
-            w.writerow(r)
-
-    print(f'  total_duration_sec 已调整: {adjusted_count} 个说话人')
-    print(f'  累计增加 clone 时长: {total_added_hours:,.1f} 小时')
-
-print(f'  扫描 clone 目录: {len(clone_roots)} 个 ({clone_roots_str})')
-print(f'  找到有 clone 的说话人: {len(clone_dur_map)} 个')
-PYEOF2
+# Step 1a (display-only clone-duration scan) removed — 04 scans CLONE_ROOT itself.
 
 # Step 1b: 预算分配 (直接用原始 STATS_CSV; 04 自身扫描 --clone-root 计入 clone 时长, 避免双重计入)
 log_step "ALLOC" "预算分配 (total_clone_hours=${TOTAL_CLONE_HOURS})"
@@ -558,12 +550,11 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --total-rounds ${TOTAL_ROUNDS} \
                 --out-csv ${ROUND_CSV}"
 
-        # 检查是否有待克隆项
+        # 检查是否有待克隆项 (为 0 时跳过 TTS/克隆, 仍跑 SIM/CER 以便补评)
         has_clones=$(python -c "import csv; rows=csv.DictReader(open('${ROUND_CSV}','r')); print(sum(int(r.get('clones_needed',0)) for r in rows))") 2>/dev/null || true
         if [ "${has_clones:-0}" = "0" ]; then
-            echo "✅ 本轮无需克隆，所有说话人已达预算上限"
-            continue
-        fi
+            echo "✅ 本轮无需克隆，所有说话人已达预算上限 (仍继续 SIM/CER)"
+        else
 
         # ---- 启动 TTS → 克隆 → 停止 TTS (释放 GPU 给后续评估) ----
         log_step "SGLANG" "启动 TTS 服务 (Round ${round})"
@@ -589,7 +580,8 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
             sleep 10
         done
         if [ "${all_ready}" -ne 1 ]; then
-            echo "  ⚠️  健康检查超时 (300s): 仍有 TTS server 未就绪; 克隆步骤会自检并可能致命失败 (EXIT trap 会清理 TTS)"
+            echo "  ❌ 健康检查超时 (300s): 仍有 TTS server 未就绪 (EXIT trap 会清理 TTS)"
+            exit 1
         fi
 
         # 每轮 seed 不同 (round * 1000000 偏移, 远大于单说话人 clone 数, 避免与 clone_idx 混叠):
@@ -606,8 +598,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --seed ${ROUND_SEED} \
                 --post-prune \
                 --max-new-tokens ${TTS_MAX_NEW_TOKENS} \
-                --estimate-clone-duration ${ESTIMATE_CLONE_DURATION} \
-                --quality-pass-rate ${QUALITY_PASS_RATE}"
+                --estimate-clone-duration ${ESTIMATE_CLONE_DURATION}"
 
         stop_tts
         echo "  ✅ TTS 已停止 (含 spawn 引擎子进程), GPU 释放"
@@ -617,6 +608,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
         if [ -f "${CLONE_SUMMARY}" ]; then
             cp "${CLONE_SUMMARY}" "${ROUND_DIR}/clone_summary.json"
         fi
+        fi  # has_clones != 0
     else
         echo "  ⏭  跳过克隆 (START_STEP=${START_STEP}), 复用磁盘已有 clone"
     fi
@@ -631,7 +623,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --skip-existing \
                 --gpus ${ALL_GPUS} \
                 --scan-workers ${SCAN_WORKERS} \
-                --workers ${SIM_WORKERS}" || echo "⚠️  SIM 评估失败，跳过 SIM 剪枝，继续 CER"
+                --workers ${SIM_WORKERS}" || { echo "⚠️  SIM 评估失败，跳过 SIM 剪枝，继续 CER"; PIPELINE_FAILED=1; }
 
         # 释放 SIM 占用的 GPU: 杀主进程 + 回收孤儿 spawn worker (omnivoice env)
         pkill -f "eval_sim.py" 2>/dev/null || true
@@ -650,7 +642,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --eval-source sidecar \
                 --eval-workers ${PRUNE_WORKERS} \
                 --scan-workers ${SCAN_WORKERS} \
-                --workers ${PRUNE_WORKERS}" || echo "⚠️  SIM 剪枝失败，继续 CER"
+                --workers ${PRUNE_WORKERS}" || { echo "⚠️  SIM 剪枝失败，继续 CER"; PIPELINE_FAILED=1; }
     else
         echo "  ⏭  跳过 SIM 评估/剪枝 (START_STEP=${START_STEP}), 复用已有 .sim.json"
     fi
@@ -679,7 +671,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --batch-size ${CER_BATCH} \
                 --audio-workers ${ASR_AUDIO_WORKERS} \
                 --asr-max-new-tokens ${ASR_MAX_NEW_TOKENS} \
-                ${LANG_GROUP_ARG}" || echo "⚠️  CER 评估失败，跳过 CER 剪枝，继续下一轮"
+                ${LANG_GROUP_ARG}" || { echo "⚠️  CER 评估失败，跳过 CER 剪枝，继续下一轮"; PIPELINE_FAILED=1; }
 
         # 释放 CER (ASR) 占用的 GPU: 杀主进程 + 回收孤儿 vllm/spawn worker (qwen3-asr env)
         pkill -f "eval_cer.py" 2>/dev/null || true
@@ -698,7 +690,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --eval-source sidecar \
                 --eval-workers ${PRUNE_WORKERS} \
                 --scan-workers ${SCAN_WORKERS} \
-                --workers ${PRUNE_WORKERS}" || echo "⚠️  CER 剪枝失败，继续下一轮"
+                --workers ${PRUNE_WORKERS}" || { echo "⚠️  CER 剪枝失败，继续下一轮"; PIPELINE_FAILED=1; }
     else
         echo "  ⏭  跳过 CER 评估/剪枝 (START_STEP=${START_STEP}), 复用已有 .cer.json"
     fi
@@ -740,9 +732,12 @@ python ${V3_CLONE_DIR}/04_post_prune_stats.py \
     --estimate-clone-duration ${ESTIMATE_CLONE_DURATION}
 
 log_step "FINAL" "最终质量验证"
-python ${EVAL_DIR}/verify_kept_clones.py --out-dir ${CLONE_ROOT} \
+if ! python ${EVAL_DIR}/verify_kept_clones.py --out-dir ${CLONE_ROOT} \
     --min-sim ${MIN_SIM} --max-cer ${MAX_CER} \
-    --eval-source sidecar --eval-workers ${PRUNE_WORKERS} || true
+    --eval-source sidecar --eval-workers ${PRUNE_WORKERS}; then
+    echo "⚠️  verify_kept_clones 未通过"
+    PIPELINE_FAILED=1
+fi
 
 # 汇总各轮统计
 echo ""
@@ -757,3 +752,8 @@ for rpad in $(seq -w 1 ${TOTAL_ROUNDS}); do
         echo "  第 ${rpad} 轮后: ${count} 条 clone"
     fi
 done
+
+if [ "${PIPELINE_FAILED}" -ne 0 ]; then
+    echo "❌ 流水线存在失败步骤 (PIPELINE_FAILED=${PIPELINE_FAILED})"
+    exit 1
+fi

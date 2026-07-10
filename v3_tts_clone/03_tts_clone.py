@@ -74,12 +74,10 @@ def _next_clone_file_idx(out_dir: str) -> int:
     return max_idx + 1
 
 
-def _resolve_clone_indices(out_dir: str, csv_start_idx: int) -> tuple[int, int]:
-    """Return (file_start, text_offset) for clone filenames vs text pool offset."""
-    local_start = _next_clone_file_idx(out_dir)
-    if local_start < csv_start_idx:
-        return local_start, csv_start_idx + local_start
-    return local_start, local_start
+def _resolve_clone_indices(out_dir: str, csv_start_idx: int) -> int:
+    """Return file_start for clone filenames (disk-based; csv_start_idx is unused legacy)."""
+    del csv_start_idx  # kept for call-site compatibility; filenames follow disk only
+    return _next_clone_file_idx(out_dir)
 
 
 # ---- SGLang TTS Client ----
@@ -502,9 +500,11 @@ def clone_speaker(
     with open(os.path.join(ref_dir, "ref_pool.json"), "w") as jf:
         json.dump(pool_meta, jf, ensure_ascii=False, indent=2)
 
-    file_start, _text_base = _resolve_clone_indices(out_dir, start_clone_idx)
+    file_start = _resolve_clone_indices(out_dir, start_clone_idx)
     ref_cache: dict[str, tuple[str, str, str, dict]] = {}
 
+    progress_every = 1000
+    t0 = time.time()
     for j in range(clones_needed):
         i = file_start + j
         clone_wav = os.path.join(out_dir, f"clone_{i:04d}.wav")
@@ -575,6 +575,17 @@ def clone_speaker(
             result["clones_failed"] += 1
             print(f"  [{i}] ERROR: {e}", flush=True)
 
+        done_n = result["clones_done"] + result["clones_failed"]
+        if done_n > 0 and done_n % progress_every == 0:
+            elapsed = max(1e-6, time.time() - t0)
+            rate = done_n / elapsed
+            print(
+                f"  [{uid}] progress {done_n}/{clones_needed} "
+                f"(ok={result['clones_done']} fail={result['clones_failed']}) "
+                f"{rate:.1f}/s",
+                flush=True,
+            )
+
     return result
 
 
@@ -623,7 +634,12 @@ def main():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--base-port", type=int, default=8000)
     parser.add_argument("--num-servers", type=int, default=2)
-    parser.add_argument("--quality-pass-rate", type=float, default=0.5)
+    parser.add_argument(
+        "--quality-pass-rate",
+        type=float,
+        default=0.5,
+        help="Only used in non --post-prune path (inflate clones_needed for expected prune rate)",
+    )
     parser.add_argument("--workers-per-server", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-speakers", type=int, default=None)

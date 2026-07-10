@@ -20,6 +20,8 @@
 06_filter_copy_by_sim.py       按 raw SIM 阈值过滤并拷贝老 clone 目录 (合并/去重名, 见下文)
 07_topup_pipeline.sh           补齐(top-up)流水线启动器: 把已有过滤 clone 计入 baseline (见下文)
 07_topup_pipeline.env          07 的配置 (源=audio, 统计口径含已过滤 clone 目录)
+08_resume_topup.sh             从中断轮续跑 topup (默认 START_ROUND=2 START_STEP=clone)
+08_preflight_resume.py         续跑前预检 (allocation / 磁盘 / GPU / 建议 START_STEP)
 ```
 
 ---
@@ -184,6 +186,28 @@ SURVIVAL_EST=0.4 bash v3_tts_clone/07_topup_pipeline.sh
 TOTAL_CLONE_HOURS=12000 bash v3_tts_clone/07_topup_pipeline.sh
 ```
 
+## 从中断轮续跑 (`08_resume_topup.sh`)
+
+中断后不要手敲一长串变量。`08` 会 source `07_topup_pipeline.env`、清理残留 TTS、跑预检，再以续跑模式启动 `07→05`。
+
+默认：**v5 topup 从第 2 轮 `clone` 接上**（`03` 对已有 wav+json 幂等跳过）。
+
+```bash
+# 预检 only
+DRY_RUN=1 bash v3_tts_clone/08_resume_topup.sh
+
+# 正式续跑 (tmux)
+tmux new-session -d -s higgs_v5r2 "bash v3_tts_clone/08_resume_topup.sh"
+tail -f clone_workdir/iterative_pipeline_v5/pipeline_*.log
+
+# 覆盖步: 第2轮从 SIM 开始
+START_ROUND=2 START_STEP=sim bash v3_tts_clone/08_resume_topup.sh
+# 采用预检建议的 START_STEP
+ADOPT_SUGGEST=1 bash v3_tts_clone/08_resume_topup.sh
+```
+
+---
+
 ## 评估提速 (CER)
 
 - **`ASR_BACKEND=vllm`（默认，推荐）**：CER 用 vLLM 后端（`Qwen3ASRModel.LLM`，`tensor_parallel_size`=卡数），连续批处理把 GPU 吃满。旧的 `transformers` 后端用「单进程多线程」驱动多卡受 GIL 限制、`model.generate` 自回归解码利用率低。已验证 vLLM 与 transformers 转写结果逐条一致（CER 等价）。
@@ -217,6 +241,6 @@ START_ROUND=3 bash v3_tts_clone/05_iterative_pipeline.sh
 START_ROUND=3 START_STEP=sim bash v3_tts_clone/05_iterative_pipeline.sh
 ```
 
-- `START_STEP` 取值：`clone`(默认) < `cer` < `sim` < `prune`。起始轮只跑 `>=` 该步的部分，之后的轮次都从 `clone` 完整跑。
+- `START_STEP` 取值：`clone`(默认) < `sim` < `cer`。起始轮只跑 `>=` 该步的部分，之后的轮次都从 `clone` 完整跑。
 - 一旦 `START_ROUND>1` 或 `START_STEP!=clone`，即进入**续跑模式**：跳过 ASR 转写与预算分配，复用已有的 `allocation/` 基准（`speaker_duration_stats_post_prune_resume.csv` + `original_clones_needed.json`）——若这两个文件缺失会直接报错，需先完整跑一次到分配完成。
 - 复用来源：磁盘已有 clone（`03_tts_clone.py` 跳过已存在文件）、已有 `.cer.json` / `.sim.json`（评估 `--skip-existing`）。

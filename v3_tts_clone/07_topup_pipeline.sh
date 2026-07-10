@@ -29,11 +29,27 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Preserve caller START_* before sourcing env (07.env exports START_ROUND=1 for fresh runs).
+_CALLER_START_ROUND="${START_ROUND-}"
+_CALLER_START_STEP="${START_STEP-}"
+
+# shellcheck disable=SC1091
 source "${HERE}/07_topup_pipeline.env"
 
 SURVIVAL_EST="${SURVIVAL_EST:-0.1}"
-START_ROUND="${START_ROUND:-1}"
-START_STEP="${START_STEP:-clone}"
+# Prefer caller override; else env; else defaults
+if [ -n "${_CALLER_START_ROUND}" ]; then
+    START_ROUND="${_CALLER_START_ROUND}"
+else
+    START_ROUND="${START_ROUND:-1}"
+fi
+if [ -n "${_CALLER_START_STEP}" ]; then
+    START_STEP="${_CALLER_START_STEP}"
+else
+    START_STEP="${START_STEP:-clone}"
+fi
+export START_ROUND START_STEP
 FORCE_STATS="${FORCE_STATS:-0}"
 SCAN_WORKERS="${SCAN_WORKERS:-64}"
 STATS_OUTPUT_DIR="$(dirname "${STATS_CSV}")"
@@ -63,7 +79,15 @@ if [ "${RESUMING}" -eq 0 ] && [ -z "${TOTAL_CLONE_HOURS:-}" ]; then
     fi
 
     GAP_HOURS="$(python3 -c "import json;print(json.load(open('${STATS_OUTPUT_DIR}/summary.json'))['gap_hours'])")"
+    if python3 -c "import sys; sys.exit(0 if float('${GAP_HOURS}') <= 0 else 1)"; then
+        echo "[07] gap=${GAP_HOURS}h ≤ 0: 无需补齐, 退出"
+        exit 0
+    fi
     TOTAL_CLONE_HOURS="$(python3 -c "import math;print(int(math.ceil(${GAP_HOURS} / ${SURVIVAL_EST})))")"
+    if [ "${TOTAL_CLONE_HOURS}" -eq 0 ]; then
+        echo "[07] TOTAL_CLONE_HOURS=0: 无需补齐, 退出"
+        exit 0
+    fi
     export TOTAL_CLONE_HOURS
     echo "[07] gap=${GAP_HOURS}h  survival_est=${SURVIVAL_EST}  →  TOTAL_CLONE_HOURS=${TOTAL_CLONE_HOURS}"
 elif [ -n "${TOTAL_CLONE_HOURS:-}" ]; then

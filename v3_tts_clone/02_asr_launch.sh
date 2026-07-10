@@ -49,17 +49,19 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 PIDS=()
+SHARD_INDEX=0
 for GPU_ID in "${GPU_ARR[@]}"; do
-    echo "Launching worker on GPU $GPU_ID..."
+    echo "Launching worker on GPU $GPU_ID (shard $SHARD_INDEX/$TOTAL_GPUS)..."
     CUDA_VISIBLE_DEVICES=$GPU_ID \
         $CONDA_PYTHON "$SCRIPT_DIR/02_asr_worker.py" \
             --stats-csv "$STATS_CSV" \
-            --gpu-id "$GPU_ID" \
+            --shard-index "$SHARD_INDEX" \
             --total-gpus "$TOTAL_GPUS" \
             --local-model "$LOCAL_MODEL" \
             --files-per-batch "$FILES_PER_BATCH" \
             --target-sec "$TARGET_SEC" &
     PIDS+=($!)
+    SHARD_INDEX=$((SHARD_INDEX + 1))
 done
 
 echo ""

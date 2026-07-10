@@ -33,7 +33,8 @@ CSV_FIELDS = [
     "dataset",
     "speaker_id",
     "num_files",
-    "source_duration_sec",
+    "baseline_duration_sec",  # STATS_CSV total_duration_sec (source-only or source+clone-dirs)
+    "source_duration_sec",  # same value as baseline_duration_sec (legacy alias)
     "clone_duration_sec",
     "total_duration_sec",
     "gap_sec",
@@ -96,7 +97,7 @@ def _process_row(row: dict, clone_root: str, target_sec: float = TARGET_DURATION
     if num_files < MIN_SOURCE_FILES:
         return None
 
-    source_dur = float(row["total_duration_sec"])
+    source_dur = float(row["total_duration_sec"])  # baseline from STATS (may include --clone-dirs)
     dataset = row["dataset"]
     speaker_id = row["speaker_id"]
     clone_dir = os.path.join(clone_root, dataset, speaker_id)
@@ -109,7 +110,8 @@ def _process_row(row: dict, clone_root: str, target_sec: float = TARGET_DURATION
         "speaker_id": speaker_id,
         "speaker_path": row["speaker_path"],
         "num_files": num_files,
-        "source_duration_sec": round(source_dur, 2),
+        "baseline_duration_sec": round(source_dur, 2),
+        "source_duration_sec": round(source_dur, 2),  # legacy alias of baseline_duration_sec
         "clone_duration_sec": round(clone_dur, 2),
         "total_duration_sec": round(combined, 2),
         "gap_sec": round(gap, 2),

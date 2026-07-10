@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright (c) 2025 Boson AI
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#!/usr/bin/env python3
 """Filter previously-cloned dirs by raw cosine SIM and COPY the survivors elsewhere.
 
 Reuses the ALREADY-computed sidecars (no GPU, no re-embedding, no reference files):
@@ -21,7 +21,7 @@ Since mapped = (raw + 1) / 2 EXACTLY, raw cosine is recovered losslessly as
   raw = 2 * similarity - 1        (for --sim-scale mapped, the default for old dirs)
 
 KEEP + COPY a clone (wav + every sidecar) if
-      raw_cos > --min-sim-raw     (default 0.8)
+      raw_cos >= --min-sim-raw    (default 0.8; matches prune sim < min)
 A clone with no .sim.json (or missing `similarity`) is SKIPPED (cannot judge).
 
 The destination mirrors the source's {dataset}/{speaker}/ subdir structure exactly.
@@ -153,7 +153,7 @@ def _process_unit(task: tuple) -> dict:
             c["total"] += 1
             c["dur_total"] += dur
             by_ds[dataset][0] += 1
-            if raw <= min_sim_raw:
+            if raw < min_sim_raw:
                 c["below"] += 1
                 continue
             c["kept"] += 1
@@ -297,7 +297,7 @@ def main():
         default=None,
         help="Override default jobs, each as SRC:DEST:PREFIX (prefix optional). Colons in paths not supported.",
     )
-    ap.add_argument("--min-sim-raw", type=float, default=0.8, help="Keep+copy if raw cosine > this (default 0.8)")
+    ap.add_argument("--min-sim-raw", type=float, default=0.8, help="Keep+copy if raw cosine >= this (default 0.8)")
     ap.add_argument(
         "--sim-scale",
         choices=("mapped", "raw"),

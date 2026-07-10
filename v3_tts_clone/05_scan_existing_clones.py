@@ -26,13 +26,19 @@ def _count_dir(args: tuple) -> list:
         try:
             with os.scandir(spk_dir) as it:
                 for e in it:
-                    if not CLONE_WAV_RE.match(e.name):
+                    m = CLONE_WAV_RE.match(e.name)
+                    if not m:
                         continue
+                    # Match 03_tts_clone skip: wav>1000 bytes AND sidecar .json exists
                     try:
-                        if e.stat().st_size > 1000:
-                            cnt += 1
+                        if e.stat().st_size <= 1000:
+                            continue
                     except OSError:
-                        pass
+                        continue
+                    json_path = os.path.join(spk_dir, f"clone_{m.group(1)}.json")
+                    if not os.path.isfile(json_path):
+                        continue
+                    cnt += 1
         except OSError:
             pass
         if cnt > 0:

@@ -21,7 +21,8 @@ TOTAL=${#GPU_ARR[@]}
 echo "=== Starting SGLang Higgs v3 TTS Servers ==="
 echo "GPUs: ${GPU_ARR[*]}"
 echo "Model: $MODEL"
-echo "Ports: $((BASE_PORT + GPU_ARR[0])) - $((BASE_PORT + GPU_ARR[TOTAL - 1]))"
+# Ports are BASE_PORT + list index (0..N-1), NOT physical GPU id — matches 03_tts_clone.py.
+echo "Ports: ${BASE_PORT} - $((BASE_PORT + TOTAL - 1))  (index-based; GPUs=${GPU_ARR[*]})"
 echo ""
 
 echo "Cleaning stale sgl-omni processes..."
@@ -61,9 +62,10 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 PIDS=()
-for GPU in "${GPU_ARR[@]}"; do
-    PORT=$((BASE_PORT + GPU))
-    echo "Starting server on GPU $GPU, port $PORT..."
+for i in "${!GPU_ARR[@]}"; do
+    GPU="${GPU_ARR[$i]}"
+    PORT=$((BASE_PORT + i))
+    echo "Starting server on GPU $GPU, port $PORT (index $i)..."
     CUDA_VISIBLE_DEVICES=$GPU \
         "$SGL_OMNI" serve \
             --model-path "$MODEL" \
@@ -78,10 +80,11 @@ echo "All $TOTAL servers launched."
 echo "Waiting for servers to be ready..."
 sleep 30
 
-# Quick health check
+# Quick health check (ports = BASE_PORT + index)
 ALL_OK=1
-for GPU in "${GPU_ARR[@]}"; do
-    PORT=$((BASE_PORT + GPU))
+for i in "${!GPU_ARR[@]}"; do
+    GPU="${GPU_ARR[$i]}"
+    PORT=$((BASE_PORT + i))
     STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/health" 2>/dev/null || echo "000")
     if [ "$STATUS" = "200" ]; then
         echo "  GPU $GPU :$PORT → OK"
