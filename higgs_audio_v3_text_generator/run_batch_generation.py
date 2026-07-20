@@ -5,7 +5,6 @@ Uses ThreadPoolExecutor for concurrent requests + diversity compact prompt.
 """
 
 import argparse
-import json
 import os
 import re
 import sys
@@ -20,10 +19,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from higgs_text_gen.checkpoint import load_checkpoint, save_checkpoint
 from higgs_text_gen.compact_prompt import build_compact_prompt
 from higgs_text_gen.config import GenConfig
-from higgs_text_gen.dedup import build_duplicate_index, deduplicate, semantic_deduplicate
+from higgs_text_gen.dedup import (
+    build_duplicate_index,
+    deduplicate,
+    filter_incremental_duplicates,
+    semantic_deduplicate,
+)
 from higgs_text_gen.llm_client import call_llm
 from higgs_text_gen.output import print_statistics, save_jsonl
 from higgs_text_gen.quality_filter import quality_filter
+from higgs_text_gen.stable_random import stable_int
 from higgs_text_gen.task_generator import generate_task_list
 from higgs_text_gen.text_clean import attach_clean_text_batch
 
@@ -163,12 +168,12 @@ def worker_fn(task, config):
         length_key=task.get("length_key", "medium"),
         lang_key=task.get("lang_key", "pure_cn"),
         emotion=emotion,
-        batch_size=config.batch_size,
+        batch_size=task.get("request_count", task.get("target_count", config.batch_size)),
         suppression_hint=task.get("suppression_hint", ""),
         task_id=task_id or 0,
     )
 
-    seed = hash(f"{task_id}|{scenario_key}|{emotion}") & 0xFFFFFFFF
+    seed = stable_int(task_id, scenario_key, emotion, task.get("generation_attempt", 0), bits=32)
     rng = random.Random(seed)
     temp = min(1.0, max(0.65, config.temperature + rng.uniform(-0.15, 0.15)))
 
@@ -188,6 +193,7 @@ def worker_fn(task, config):
 
     for item in results:
         item["task_id"] = task_id
+        item["task_signature"] = task["task_signature"]
         item["scenario"] = item.get("scenario", scenario_key)
         item["subscene"] = item.get("subscene", task.get("subscene", ""))
         item["emotion"] = item.get("emotion", emotion)
@@ -200,6 +206,58 @@ def worker_fn(task, config):
         attach_clean_text_batch(results)
 
     return results
+
+
+def _task_signature(task, config):
+    """Bind checkpoint rows to the exact deterministic task configuration."""
+    signature = stable_int(
+        config.seed,
+        config.total_target,
+        config.batch_size,
+        task["task_id"],
+        task["target_count"],
+        task["scenario_key"],
+        task.get("subscene", ""),
+        task.get("emotion", ""),
+        task.get("length_key", ""),
+        task.get("lang_key", ""),
+    )
+    return f"v2-{signature:016x}"
+
+
+def _sanitize_checkpoint(items, task_by_id):
+    """Drop stale, duplicate, malformed, and over-target checkpoint rows."""
+    kept = []
+    counts = Counter()
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        task_id = item.get("task_id")
+        task = task_by_id.get(task_id)
+        if task is None:
+            continue
+        signature = item.get("task_signature")
+        if signature is None:
+            legacy_fields = {
+                "subscene": "subscene",
+                "emotion": "emotion",
+                "length_type": "length_key",
+                "lang_type": "lang_key",
+            }
+            if any(item.get(old) != task.get(new) for old, new in legacy_fields.items()):
+                continue
+            item = dict(item)
+            item["task_signature"] = task["task_signature"]
+        elif signature != task["task_signature"]:
+            continue
+        norm = _normalize_for_dedup(item.get("text", ""))
+        if not norm or norm in seen or counts[task_id] >= task["target_count"]:
+            continue
+        seen.add(norm)
+        counts[task_id] += 1
+        kept.append(item)
+    return kept
 
 
 def main():
@@ -216,6 +274,12 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="batch_output/.checkpoint.jsonl")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-postprocess", action="store_true", help="Skip final dedup/quality for speed")
+    parser.add_argument(
+        "--max-task-attempts",
+        type=int,
+        default=5,
+        help="Maximum content-generation attempts for a partial/failed task",
+    )
     args = parser.parse_args()
 
     config = GenConfig(
@@ -226,7 +290,7 @@ def main():
         base_url=args.base_url or os.environ.get("LLM_BASE_URL", "http://localhost:8000"),
         api_key=args.api_key or os.environ.get("LLM_API_KEY", "EMPTY"),
         temperature=args.temperature,
-        seed=args.seed or int(time.time()),
+        seed=args.seed if args.seed is not None else 42,
         output_dir=os.path.dirname(args.output) or "batch_output",
     )
 
@@ -236,24 +300,45 @@ def main():
     )
     print(f"Model: {config.model}  Base: {config.base_url}")
 
-    all_texts = load_checkpoint(args.checkpoint) if args.resume else []
-    print(f"Loaded {len(all_texts)} from checkpoint")
-
     tasks = generate_task_list(config)
-    completed_ids = {t.get("task_id", -1) for t in all_texts}
-    pending = [t for t in tasks if t["task_id"] not in completed_ids]
+    for task in tasks:
+        task["task_signature"] = _task_signature(task, config)
+    task_by_id = {task["task_id"]: task for task in tasks}
+    loaded_texts = load_checkpoint(args.checkpoint) if args.resume else []
+    all_texts = _sanitize_checkpoint(loaded_texts, task_by_id)
+    if not args.no_postprocess and all_texts:
+        all_texts = quality_filter(
+            semantic_deduplicate(deduplicate(all_texts), threshold=config.semantic_dedup_threshold),
+            max_tags_per_text=config.max_tags_per_text,
+            max_same_tag_repeat=config.max_same_tag_repeat,
+        )
+    print(f"Loaded {len(all_texts)}/{len(loaded_texts)} valid rows from checkpoint")
+
+    task_counts = Counter(item.get("task_id") for item in all_texts if item.get("task_id") in task_by_id)
+    last_attempt = {}
+    for item in all_texts:
+        task_id = item.get("task_id")
+        if task_id in task_by_id:
+            last_attempt[task_id] = max(last_attempt.get(task_id, -1), int(item.get("generation_attempt", -1)))
+
+    pending = []
+    for task in tasks:
+        remaining = task["target_count"] - task_counts.get(task["task_id"], 0)
+        if remaining > 0:
+            queued = dict(task)
+            queued["request_count"] = remaining
+            queued["generation_attempt"] = last_attempt.get(task["task_id"], -1) + 1
+            pending.append(queued)
     print(f"Tasks: {len(tasks)} total, {len(pending)} pending")
 
     if not pending:
-        print("All done!")
-        return
+        print("All raw task targets are already complete; rebuilding output from checkpoint")
 
     lock = threading.Lock()
-    seen_norm = set()
-    for item in all_texts:
-        seen_norm.add(_normalize_for_dedup(item.get("text", "")))
+    seen_norm, context_index = build_duplicate_index(all_texts)
 
-    completed = 0
+    completed = sum(1 for task in tasks if task_counts.get(task["task_id"], 0) >= task["target_count"])
+    attempts = 0
     failed = 0
     skipped = 0
     start_time = time.time()
@@ -287,15 +372,46 @@ def main():
                 if results:
                     with lock:
                         new_items = []
+                        requested = int(pending[idx]["request_count"])
+                        candidates = []
                         for item in results:
+                            if not isinstance(item, dict) or not item.get("text"):
+                                skipped += 1
+                                continue
+                            candidates.append(item)
+                        if not args.no_postprocess:
+                            before = len(candidates)
+                            candidates = quality_filter(
+                                candidates,
+                                max_tags_per_text=config.max_tags_per_text,
+                                max_same_tag_repeat=config.max_same_tag_repeat,
+                            )
+                            skipped += before - len(candidates)
+                        for item in candidates:
+                            if len(new_items) >= requested:
+                                break
+                            item["generation_attempt"] = pending[idx]["generation_attempt"]
+                            if not args.no_postprocess:
+                                accepted, duplicate_count = filter_incremental_duplicates(
+                                    [item],
+                                    seen_norm,
+                                    context_index,
+                                    same_context_threshold=config.same_context_dup_threshold,
+                                )
+                                skipped += duplicate_count
+                                if not accepted:
+                                    continue
+                                new_items.append(item)
+                                continue
                             norm = _normalize_for_dedup(item.get("text", ""))
-                            if norm in seen_norm:
+                            if not norm or norm in seen_norm:
                                 skipped += 1
                                 continue
                             seen_norm.add(norm)
                             new_items.append(item)
                         all_texts.extend(new_items)
-                        completed += 1
+                        task_id = pending[idx]["task_id"]
+                        task_counts[task_id] += len(new_items)
                 else:
                     with lock:
                         failed += 1
@@ -304,12 +420,27 @@ def main():
                 with lock:
                     failed += 1
 
+            attempts += 1
+            task = pending[idx]
+            task_id = task["task_id"]
+            target_count = task_by_id[task_id]["target_count"]
+            remaining = target_count - task_counts.get(task_id, 0)
+            if remaining <= 0:
+                completed += 1
+            elif task["generation_attempt"] + 1 < args.max_task_attempts:
+                retry = dict(task_by_id[task_id])
+                retry["request_count"] = remaining
+                retry["generation_attempt"] = task["generation_attempt"] + 1
+                pending.append(retry)
+            else:
+                print(f"Task {task_id} remains short by {remaining} text(s) after {args.max_task_attempts} attempts")
+
             with lock:
-                if completed > 0 and completed % 5 == 0:
+                if attempts > 0 and attempts % 5 == 0:
                     elapsed = time.time() - start_time
                     rate = len(all_texts) / max(1, elapsed)
                     print(
-                        f"[{completed}/{len(pending)}] ok={completed} fail={failed} "
+                        f"[{completed}/{len(tasks)}] attempts={attempts} fail={failed} "
                         f"texts={len(all_texts)} skip={skipped} rate={rate:.1f} t/s"
                     )
                     save_checkpoint(all_texts, args.checkpoint)
@@ -319,12 +450,23 @@ def main():
     save_checkpoint(all_texts, args.checkpoint)
     elapsed = time.time() - start_time
     print(
-        f"\nDone: {completed} ok {failed} fail {len(all_texts)} texts in {elapsed:.1f}s "
+        f"\nDone: {completed}/{len(tasks)} tasks {failed} failed attempts {len(all_texts)} texts in {elapsed:.1f}s "
         f"({len(all_texts) / max(1, elapsed):.1f} t/s)"
     )
 
+    underfilled = {
+        task["task_id"]: task["target_count"] - task_counts.get(task["task_id"], 0)
+        for task in tasks
+        if task_counts.get(task["task_id"], 0) < task["target_count"]
+    }
+    if underfilled:
+        save_jsonl(all_texts, args.output)
+        print(f"Saved partial output {len(all_texts)} -> {args.output}")
+        print(f"ERROR: {len(underfilled)} tasks remain underfilled; resume to retry: {underfilled}")
+        sys.exit(2)
+
     if not args.no_postprocess:
-        print(f"\nPost-processing...")
+        print("\nPost-processing...")
         all_texts = deduplicate(all_texts)
         print(f"After exact dedup: {len(all_texts)}")
         all_texts = semantic_deduplicate(all_texts, threshold=config.semantic_dedup_threshold)
@@ -333,6 +475,15 @@ def main():
             all_texts, max_tags_per_text=config.max_tags_per_text, max_same_tag_repeat=config.max_same_tag_repeat
         )
         print(f"After quality: {len(all_texts)}")
+
+        if len(all_texts) != config.total_target:
+            save_checkpoint(all_texts, args.checkpoint)
+            save_jsonl(all_texts, args.output)
+            print(
+                f"ERROR: postprocessing changed the exact result count to {len(all_texts)}; "
+                "resume will refill the missing tasks"
+            )
+            sys.exit(2)
 
     save_jsonl(all_texts, args.output)
     print(f"Saved {len(all_texts)} -> {args.output}")

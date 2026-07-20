@@ -314,6 +314,7 @@ def main():
             "insufficient": insuf,
             "clone_only_need": clone_only_need,
             "gap_hours": round(gap_total / 3600, 2),
+            "target_sec": target,
             "scan_sec": round(scan_t, 1),
             "source_dirs": a.source_dirs,
             "clone_dirs": a.clone_dirs,

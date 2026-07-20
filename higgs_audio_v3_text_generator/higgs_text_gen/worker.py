@@ -8,6 +8,7 @@ from typing import Dict, List
 from .config import GenConfig
 from .compact_prompt import build_compact_prompt
 from .llm_client import call_llm
+from .stable_random import stable_int
 from .text_clean import attach_clean_text_batch
 
 
@@ -22,12 +23,12 @@ def worker(task: Dict, config: GenConfig) -> List[Dict]:
         length_key=task.get("length_key", "medium"),
         lang_key=task.get("lang_key", "pure_cn"),
         emotion=emotion,
-        batch_size=config.batch_size,
+        batch_size=task.get("request_count", task.get("target_count", config.batch_size)),
         suppression_hint=task.get("suppression_hint", ""),
         task_id=task_id or 0,
     )
 
-    seed = hash(f"{task_id}|{scenario_key}|{emotion}") & 0xFFFFFFFF
+    seed = stable_int(task_id, scenario_key, emotion, task.get("generation_attempt", 0), bits=32)
     rng = random.Random(seed)
     batch_temperature = min(1.0, max(0.65, config.temperature + rng.uniform(-0.15, 0.15)))
 

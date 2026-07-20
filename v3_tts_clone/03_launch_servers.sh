@@ -12,8 +12,13 @@ set -euo pipefail
 GPUS="${1:-0,1}"
 MODEL="${2:-/root/models/higgs-audio-v3-tts-4b}"
 BASE_PORT="${3:-8000}"
-CONDA_PYTHON="/root/code/github_repos/higgs-audio/higgs_v3_env/bin/python3"
-SGL_OMNI="/root/code/github_repos/higgs-audio/higgs_v3_env/bin/sgl-omni"
+VENV_BIN="/root/code/github_repos/higgs-audio/higgs_v3_env/bin"
+CONDA_PYTHON="${VENV_BIN}/python3"
+SGL_OMNI="${VENV_BIN}/sgl-omni"
+# FlashInfer invokes build helpers such as `ninja` through PATH during its
+# first-run JIT compilation. Calling sgl-omni by absolute path alone does not
+# expose the rest of the virtualenv executables to child processes.
+export PATH="${VENV_BIN}:${PATH}"
 
 IFS=',' read -ra GPU_ARR <<< "$GPUS"
 TOTAL=${#GPU_ARR[@]}
@@ -48,6 +53,11 @@ fi
 
 if [ ! -x "$SGL_OMNI" ]; then
     echo "ERROR: sgl-omni executable not found at $SGL_OMNI"
+    exit 1
+fi
+
+if ! command -v ninja >/dev/null 2>&1; then
+    echo "ERROR: ninja executable not found in V3 environment PATH"
     exit 1
 fi
 

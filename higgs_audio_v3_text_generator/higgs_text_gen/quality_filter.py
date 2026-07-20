@@ -6,6 +6,7 @@ Validates tag format, SFX+onomatopoeia pairing, completeness, length.
 import re
 from typing import Dict, List
 
+from .tag_guide import validate_tag_combo
 from .tags import (
     HIGGS_TAG_RE,
     VALID_EMOTIONS,
@@ -70,9 +71,37 @@ _MALFORMED_TAG_RE = re.compile(r"<\|([a-zA-Z_]+)\|>")
 _VALID_CATEGORIES = {"emotion", "style", "sfx", "prosody"}
 
 _ANY_TAG_RE = re.compile(r"<\|([a-zA-Z_]+):([a-zA-Z_]+)\|>")
+_TAG_LIKE_RE = re.compile(r"<\|[^>]*\|>")
+
+
+def _contains_bad_marker(text: str) -> bool:
+    lower = text.lower()
+    for marker in BAD_MARKERS:
+        if marker.isascii():
+            if re.search(rf"(?<![a-z]){re.escape(marker)}(?![a-z])", lower):
+                return True
+        elif marker in lower:
+            return True
+    return False
 
 
 def _validate_higgs_tag_format(text: str) -> bool:
+    # Every tag-like token must be fully understood.  Invalid punctuation or
+    # names must not survive simply because the narrower valid regex skipped it.
+    for token in _TAG_LIKE_RE.findall(text):
+        match = HIGGS_TAG_RE.fullmatch(token)
+        if match is None:
+            return False
+    remaining = HIGGS_TAG_RE.sub("", text)
+    if "<|" in remaining or "|>" in remaining:
+        return False
+        if not (
+            (match.group(1) == "emotion" and match.group(2) in VALID_EMOTIONS)
+            or (match.group(1) == "style" and match.group(2) in VALID_STYLES)
+            or (match.group(1) == "sfx" and match.group(2) in VALID_SFX)
+            or (match.group(1) == "prosody" and match.group(2) in VALID_PROSODY)
+        ):
+            return False
     # Check for malformed tags without category prefix (e.g. <|whispering|>)
     for match in _MALFORMED_TAG_RE.finditer(text):
         bare_name = match.group(1).lower()
@@ -112,7 +141,8 @@ def _validate_sfx_onomatopoeia(text: str) -> bool:
             ono_cn = info.get("onomatopoeia_cn", [])
             ono_en = info.get("onomatopoeia_en", [])
             all_ono = ono_cn + ono_en
-            if not any(o in following for o in all_ono):
+            following_lower = following.lower()
+            if not any(o.lower() in following_lower for o in all_ono):
                 return False
     return True
 
@@ -147,8 +177,21 @@ def _validate_tag_combinations(text: str) -> List[str]:
     tags = list(HIGGS_TAG_RE.finditer(text))
     tag_names = [f"{m.group(1)}:{m.group(2)}" for m in tags]
     if len(set(tag_names)) < len(tag_names):
-        issues.append("repeated_adjacent_tags")
+        issues.append("repeated_tags")
+    valid, conflict = validate_tag_combo(tag_names)
+    if not valid:
+        issues.append(conflict or "mutually_exclusive_tags")
     return issues
+
+
+def _validate_style_semantics(text: str) -> bool:
+    tags = {(m.group(1), m.group(2)) for m in HIGGS_TAG_RE.finditer(text)}
+    if ("style", "shouting") in tags:
+        clean = HIGGS_TAG_RE.sub("", text)
+        letters = "".join(re.findall(r"[A-Za-z]", clean))
+        if len(letters) >= 3 and letters != letters.upper():
+            return False
+    return True
 
 
 def quality_filter(
@@ -163,8 +206,7 @@ def quality_filter(
         if not text or len(text) < 2:
             continue
 
-        lower = text.lower()
-        if any(m in lower for m in BAD_MARKERS):
+        if _contains_bad_marker(text):
             continue
 
         if not _validate_higgs_tag_format(text):
@@ -174,6 +216,9 @@ def quality_filter(
             continue
 
         if not _is_complete_utterance(text):
+            continue
+
+        if not _validate_style_semantics(text):
             continue
 
         tag_count, tags_list = count_tags(text)
@@ -189,10 +234,12 @@ def quality_filter(
 
         length_type = item.get("length_type", "medium")
         if not _validate_length_match(text, length_type):
+            if reject_severe_length_mismatch:
+                continue
             item["_length_warning"] = True
 
         combo_issues = _validate_tag_combinations(text)
-        if len(combo_issues) > 3:
+        if combo_issues:
             continue
 
         attach_clean_text(item)

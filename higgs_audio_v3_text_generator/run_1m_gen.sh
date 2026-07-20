@@ -15,9 +15,9 @@ fi
 
 cd /root/code/github_repos/higgs-audio/higgs_audio_v3_text_generator
 
-# Prepare output directory
+# Prepare output directory.  Never delete checkpoints here: relaunching this
+# script is the documented resume path.
 mkdir -p "$OUTDIR"
-rm -f "$OUTDIR"/.checkpoint_w*.jsonl "$OUTDIR"/generated_texts_w*.jsonl
 
 # Create tmux session with 2 panes: generation + monitoring
 tmux new-session -d -s "$SESSION" -n "gen"
@@ -39,8 +39,9 @@ echo "  Detach: Ctrl+B D"
 echo "  Kill:   tmux kill-session -t $SESSION"
 echo "  Log:    tail -f /tmp/higgs_1m_gen.log"
 echo ""
-echo "Estimated time for 1M texts: ~40 hours (1.25M batches × bsize=8 ≈ 7 texts/s)"
+echo "Estimated time for 1M raw texts: ~40 hours (125K batches × bsize=8)"
 echo "Checkpoints saved to ${OUTDIR}/.checkpoint_w*.jsonl every 5 batches"
+echo "After all workers reach the exact raw target, final dedup + quality filtering runs automatically."
 echo ""
 echo "To resume after crash:"
 echo "  tmux kill-session -t $SESSION"

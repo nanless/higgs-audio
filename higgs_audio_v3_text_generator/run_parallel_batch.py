@@ -6,8 +6,9 @@ Each worker uses ThreadPoolExecutor for concurrent requests to its vLLM.
 
 import argparse
 import os
-import sys
 import subprocess
+import sys
+import tempfile
 
 
 def main():
@@ -19,13 +20,23 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="batch_output")
+    parser.add_argument("--base-port", type=int, default=8000)
+    parser.add_argument("--no-postprocess", action="store_true", help="Only produce and merge exact raw output")
     args = parser.parse_args()
 
-    texts_per_worker = args.total // args.num_instances
-    vllm_ports = [8000, 8001, 8002, 8003]
+    if args.total <= 0:
+        parser.error("--total must be positive")
+    if args.num_instances <= 0:
+        parser.error("--num-instances must be positive")
+    if args.num_instances > args.total:
+        parser.error("--num-instances cannot exceed --total")
+    os.makedirs(args.output_dir, exist_ok=True)
+    base, remainder = divmod(args.total, args.num_instances)
+    worker_totals = [base + (1 if i < remainder else 0) for i in range(args.num_instances)]
+    vllm_ports = [args.base_port + i for i in range(args.num_instances)]
 
-    print(f"4 vLLM instances × {args.workers} threads each")
-    print(f"Total: {args.total} texts ({texts_per_worker}/instance)")
+    print(f"{args.num_instances} vLLM instances × {args.workers} threads each")
+    print(f"Total raw target: {args.total} texts (per instance: {worker_totals})")
     print(f"Batch size: {args.batch_size}")
 
     processes = []
@@ -45,7 +56,7 @@ def main():
             "-u",
             os.path.join(os.path.dirname(__file__), "run_batch_generation.py"),
             "--total",
-            str(texts_per_worker),
+            str(worker_totals[i]),
             "--batch-size",
             str(args.batch_size),
             "--workers",
@@ -59,7 +70,6 @@ def main():
             "--checkpoint",
             checkpoint,
             "--resume",
-            "--no-postprocess",
         ]
 
         print(f"Instance {i}: port {port} -> {output}")
@@ -68,25 +78,64 @@ def main():
 
     print(f"\nAll {args.num_instances} instances started. Waiting...")
 
+    failures = []
     for i, proc, output in processes:
         ret = proc.wait()
         print(f"Instance {i} done (code {ret}): {output}")
+        if ret != 0:
+            failures.append((i, ret))
+
+    if failures:
+        print(f"ERROR: worker failures: {failures}; existing checkpoints were preserved", file=sys.stderr)
+        sys.exit(1)
 
     print("\nMerging outputs...")
-    all_lines = []
-    for i, _, output in processes:
-        if os.path.exists(output):
-            with open(output) as f:
-                for line in f:
-                    if line.strip():
-                        all_lines.append(line.strip())
-
     merged = f"{args.output_dir}/generated_texts.jsonl"
-    with open(merged, "w") as f:
-        for line in all_lines:
-            f.write(line + "\n")
+    fd, tmp_path = tempfile.mkstemp(prefix=".generated_texts.", suffix=".tmp", dir=args.output_dir)
+    merged_count = 0
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as dst:
+            for _, _, output in processes:
+                if not os.path.exists(output):
+                    print(f"ERROR: missing worker output: {output}", file=sys.stderr)
+                    sys.exit(1)
+                with open(output, encoding="utf-8") as src:
+                    for line in src:
+                        if line.strip():
+                            dst.write(line if line.endswith("\n") else line + "\n")
+                            merged_count += 1
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp_path, merged)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
-    print(f"Merged {len(all_lines)} texts -> {merged}")
+    if merged_count != args.total:
+        print(f"ERROR: merged raw count {merged_count} != requested {args.total}", file=sys.stderr)
+        sys.exit(2)
+    print(f"Merged exact raw target {merged_count} -> {merged}")
+
+    if not args.no_postprocess:
+        final_output = f"{args.output_dir}/generated_texts_final.jsonl"
+        cmd = [
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "postprocess_merge.py"),
+            "--input-dir",
+            args.output_dir,
+            "--output",
+            final_output,
+            "--num-workers",
+            str(args.num_instances),
+            "--target-count",
+            str(args.total),
+        ]
+        print(f"Postprocessing -> {final_output}")
+        ret = subprocess.run(cmd, check=False).returncode
+        if ret != 0:
+            sys.exit(ret)
 
 
 if __name__ == "__main__":

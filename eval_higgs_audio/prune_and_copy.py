@@ -129,8 +129,11 @@ def _classify_all(
     sim_map: dict,
     max_cer: float,
     min_sim: float,
-) -> tuple[list[str], int, Counter, Counter]:
+    require_cer: bool = True,
+    require_sim: bool = True,
+) -> tuple[list[str], list[str], int, Counter, Counter]:
     delete_list: list[str] = []
+    missing_list: list[str] = []
     keep_count = 0
     stats: Counter = Counter()
     delete_reasons: Counter = Counter()
@@ -138,7 +141,14 @@ def _classify_all(
     for wav in wavs:
         cer = cer_map.get(wav)
         sim = sim_map.get(wav)
-        action = classify(cer, sim, max_cer=max_cer, min_sim=min_sim)
+        action = classify(
+            cer,
+            sim,
+            max_cer=max_cer,
+            min_sim=min_sim,
+            require_cer=require_cer,
+            require_sim=require_sim,
+        )
         stats[action] += 1
         if action == "DELETE":
             delete_list.append(wav)
@@ -148,9 +158,11 @@ def _classify_all(
                 delete_reasons["sim"] += 1
             if cer is not None and cer > max_cer and sim is not None and sim < min_sim:
                 delete_reasons["both"] += 1
-        else:
+        elif action == "KEEP":
             keep_count += 1
-    return delete_list, keep_count, stats, delete_reasons
+        else:
+            missing_list.append(wav)
+    return delete_list, missing_list, keep_count, stats, delete_reasons
 
 
 def main():
@@ -174,6 +186,17 @@ def main():
         help="sidecar=read per-clone .cer.json/.sim.json (authoritative, fresh); jsonl=aggregate details",
     )
     parser.add_argument("--eval-workers", type=int, default=32, help="Parallel workers for reading eval sidecars")
+    parser.add_argument(
+        "--no-require-cer",
+        action="store_true",
+        help="SIM-only gate: do not require a CER sidecar (SIM remains required)",
+    )
+    parser.add_argument(
+        "--missing-report",
+        type=Path,
+        default=None,
+        help="JSON report for paths missing required eval (default: OUT_DIR/missing_eval_report.json)",
+    )
     parser.add_argument("--log", type=Path, default=None)
     args = parser.parse_args()
 
@@ -181,7 +204,11 @@ def main():
         print(f"ERROR: clone root not found: {args.out_dir}", file=sys.stderr)
         sys.exit(1)
 
-    rules = f"DELETE: CER > {args.max_cer} OR SIM < {args.min_sim}; KEEP: otherwise"
+    require_cer = not args.no_require_cer
+    rules = (
+        f"DELETE: CER > {args.max_cer} OR SIM < {args.min_sim}; "
+        f"required=CER:{require_cer},SIM:True; KEEP only with all required metrics"
+    )
     t0 = time.time()
     cer_map, sim_map = _build_maps(args.out_dir, source=args.eval_source, workers=args.eval_workers)
     if not cer_map and not sim_map:
@@ -193,13 +220,25 @@ def main():
 
     if args.source == "disk":
         disk_wavs = scan_clone_wavs(args.out_dir, workers=args.scan_workers)
-        delete_list, keep_on_disk, stats, delete_reasons = _classify_all(
-            disk_wavs, cer_map, sim_map, args.max_cer, args.min_sim
+        delete_list, missing_list, keep_on_disk, stats, delete_reasons = _classify_all(
+            disk_wavs,
+            cer_map,
+            sim_map,
+            args.max_cer,
+            args.min_sim,
+            require_cer=require_cer,
         )
         keep_expected = sum(
             1
             for wav in set(cer_map) | set(sim_map)
-            if classify(cer_map.get(wav), sim_map.get(wav), args.max_cer, args.min_sim) == "KEEP"
+            if classify(
+                cer_map.get(wav),
+                sim_map.get(wav),
+                args.max_cer,
+                args.min_sim,
+                require_cer=require_cer,
+            )
+            == "KEEP"
         )
         print(
             f"[classify] on disk: DELETE={len(delete_list):,}  KEEP={keep_on_disk:,}  "
@@ -209,8 +248,13 @@ def main():
         keep_count = keep_on_disk
     else:
         all_wavs = sorted(set(cer_map.keys()) | set(sim_map.keys()))
-        delete_list, keep_count, stats, delete_reasons = _classify_all(
-            all_wavs, cer_map, sim_map, args.max_cer, args.min_sim
+        delete_list, missing_list, keep_count, stats, delete_reasons = _classify_all(
+            all_wavs,
+            cer_map,
+            sim_map,
+            args.max_cer,
+            args.min_sim,
+            require_cer=require_cer,
         )
         delete_list = [w for w in delete_list if os.path.isfile(w)]
         print(
@@ -218,6 +262,30 @@ def main():
             f"existing on disk={len(delete_list):,}  KEEP={keep_count:,}",
             file=sys.stderr,
         )
+
+    if missing_list:
+        missing_report = args.missing_report or (args.out_dir / "missing_eval_report.json")
+        missing_report.parent.mkdir(parents=True, exist_ok=True)
+        missing_report.write_text(
+            json.dumps(
+                {
+                    "error": "missing_required_evaluation",
+                    "require_cer": require_cer,
+                    "require_sim": True,
+                    "count": len(missing_list),
+                    "paths": missing_list,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"ERROR: {len(missing_list):,} clones lack required eval; no files were deleted. Report: {missing_report}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     tag = "[DRY-RUN] " if args.dry_run else ""
     print(f"\n{tag}DELETE {len(delete_list):,} clones on disk", file=sys.stderr)
@@ -250,6 +318,8 @@ def main():
                     "min_sim": args.min_sim,
                     "classify": dict(stats),
                     "delete_reasons": dict(delete_reasons),
+                    "require_cer": require_cer,
+                    "require_sim": True,
                 },
                 ensure_ascii=False,
                 indent=2,

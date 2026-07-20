@@ -3,17 +3,22 @@ Task generation with guaranteed subscene/emotion/length coverage.
 Each consecutive 3-tasks within same scenario must cover different subscenes.
 """
 
+import math
 import random
 from typing import Dict, List
 
-from .scenarios import SCENARIOS, EMOTIONS, LENGTH_SPECS, LANG_MIX_SPECS
+from .scenarios import EMOTIONS, SCENARIOS
 from .config import GenConfig
 
 
 def generate_task_list(config: GenConfig) -> List[Dict]:
     rng = random.Random(config.seed)
 
-    total_batches = max(1, config.total_target // config.batch_size)
+    if config.total_target <= 0:
+        return []
+    if config.batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    total_batches = math.ceil(config.total_target / config.batch_size)
 
     regular_scenarios = {k: v for k, v in SCENARIOS.items() if not v.get("is_stress_test")}
     stress_scenarios = {k: v for k, v in SCENARIOS.items() if v.get("is_stress_test")}
@@ -129,7 +134,10 @@ def generate_task_list(config: GenConfig) -> List[Dict]:
         )
 
     rng.shuffle(tasks)
+    remaining = config.total_target
     for idx, task in enumerate(tasks):
         task["task_id"] = idx
+        task["target_count"] = min(config.batch_size, remaining)
+        remaining -= task["target_count"]
 
     return tasks

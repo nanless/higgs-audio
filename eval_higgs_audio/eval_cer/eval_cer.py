@@ -52,7 +52,8 @@ EVAL_DIR = Path(__file__).resolve().parent
 PARENT_DIR = EVAL_DIR.parent
 sys.path.insert(0, str(PARENT_DIR))
 
-from eval_common import CerAccumulator, append_jsonl, append_jsonl_lines, list_clone_items, write_json  # noqa: E402
+from eval_common import CerAccumulator, append_jsonl_lines, list_clone_items, write_json  # noqa: E402
+from asr_cache import get_cached_asr_text, set_cached_asr_text  # noqa: E402
 
 
 QWEN3_ASR_LOCAL = "/root/.cache/huggingface/hub/Qwen3-ASR-1.7B-local"
@@ -215,25 +216,6 @@ def sort_pairs_by_language(pairs: list, workers: int = 16) -> list:
         dist[lg] += 1
     print(f"Language pre-grouping: {dict(dist)} in {time.time() - t0:.1f}s", flush=True)
     return [pairs[i] for i in order]
-
-
-def get_cached_asr_text(asr_results: dict, wav_path: Path, language: str) -> str | None:
-    entry = asr_results.get(str(wav_path))
-    if entry is None:
-        return None
-    if isinstance(entry, dict):
-        if entry.get("language") == language:
-            return entry.get("text") or None
-        return None
-    # Legacy cache entries were produced with the old fixed Chinese prompt.
-    if language == "Chinese":
-        text = str(entry)
-        return text or None
-    return None
-
-
-def set_cached_asr_text(asr_results: dict, wav_path: Path, language: str, text: str) -> None:
-    asr_results[str(wav_path)] = {"text": text, "language": language}
 
 
 def has_cached_asr_text(asr_results: dict, wav_path: Path, json_path: Path) -> bool:

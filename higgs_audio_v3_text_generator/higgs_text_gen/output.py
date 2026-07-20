@@ -4,6 +4,7 @@ Output formatting and statistics.
 
 import json
 import os
+import tempfile
 from collections import Counter
 from typing import Dict, List
 
@@ -27,11 +28,22 @@ def format_jsonl_record(item: Dict) -> Dict:
 
 
 def save_jsonl(texts: List[Dict], path: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for item in texts:
-            record = format_jsonl_record(item)
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for item in texts:
+                record = format_jsonl_record(item)
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 def print_statistics(texts: List[Dict]):

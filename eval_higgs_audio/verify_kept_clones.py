@@ -100,7 +100,7 @@ def verify(wavs: list[str], cer_map: dict, sim_map: dict, max_cer: float, min_si
     for wav in wavs:
         cer = cer_map.get(wav)
         sim = sim_map.get(wav)
-        if cer is None and sim is None:
+        if cer is None or sim is None:
             missing_eval += 1
             counts["missing_eval"] += 1
         action = classify(cer, sim, max_cer=max_cer, min_sim=min_sim)
@@ -207,7 +207,7 @@ def main():
     print("\n  By dataset (on disk):")
     print(f"  {'Dataset':<28s} {'KEEP':>10s} {'DELETE':>10s} {'miss':>8s}")
     for ds, c in report["by_dataset"].items():
-        print(f"  {ds:<28s} {c.get('KEEP', 0):>10,} {c.get('DELETE', 0):>10,} {c.get('missing_eval', 0):>8,}")
+        print(f"  {ds:<28s} {c.get('KEEP', 0):>10,} {c.get('DELETE', 0):>10,} {c.get('MISSING_EVAL', 0):>8,}")
     print("=" * 72)
 
     if args.output_json:

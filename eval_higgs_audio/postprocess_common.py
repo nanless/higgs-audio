@@ -40,7 +40,10 @@ SIDECAR_RENAME = {".eval.json": ".cer.json"}
 DEFAULT_MAX_CER = 0.03
 DEFAULT_MIN_SIM = 0.8  # raw cosine (encoder now returns raw cos, not (cos+1)/2)
 
-PRUNE_RULES_TEXT = f"DELETE: CER > {DEFAULT_MAX_CER} OR SIM < {DEFAULT_MIN_SIM}; KEEP: otherwise"
+PRUNE_RULES_TEXT = (
+    f"DELETE: CER > {DEFAULT_MAX_CER} OR SIM < {DEFAULT_MIN_SIM}; "
+    "MISSING_EVAL when a required metric is absent; KEEP otherwise"
+)
 
 SKIP_DIR_NAMES = frozenset({"logs", "__pycache__", "eval_sim_embedding_cache"})
 
@@ -219,8 +222,16 @@ def classify(
     sim: float | None,
     max_cer: float = DEFAULT_MAX_CER,
     min_sim: float = DEFAULT_MIN_SIM,
+    require_cer: bool = True,
+    require_sim: bool = True,
 ) -> str:
-    """Return DELETE | KEEP."""
+    """Return DELETE, KEEP, or MISSING_EVAL.
+
+    Missing required quality measurements are never treated as passing.  A
+    caller performing a SIM-only gate must opt out of CER explicitly.
+    """
+    if (require_cer and cer is None) or (require_sim and sim is None):
+        return "MISSING_EVAL"
     if cer is not None and cer > max_cer:
         return "DELETE"
     if sim is not None and sim < min_sim:
@@ -258,7 +269,9 @@ def classify_records(
         "missing_sim": missing_sim,
         "max_cer": max_cer,
         "min_sim": min_sim,
-        "rules": f"DELETE: CER > {max_cer} OR SIM < {min_sim}; KEEP: otherwise",
+        "rules": (
+            f"DELETE: CER > {max_cer} OR SIM < {min_sim}; MISSING_EVAL: required metric absent; KEEP: otherwise"
+        ),
     }
 
 
@@ -403,7 +416,7 @@ def analyze_prune_breakdown(
 ) -> dict[str, Any]:
     """Detailed DELETE/KEEP analysis for current prune thresholds."""
     total = len(table)
-    delete_n = keep_n = 0
+    delete_n = keep_n = missing_n = 0
     reason_cer_only = reason_sim_only = reason_both = 0
     delete_cers: list[float] = []
     delete_sims: list[float] = []
@@ -462,7 +475,7 @@ def analyze_prune_breakdown(
             elif sim_bad:
                 reason_sim_only += 1
                 by_dataset[ds]["sim_only"] += 1
-        else:
+        elif action == "KEEP":
             keep_n += 1
             by_dataset[ds]["keep"] += 1
             by_language[lang]["keep"] += 1
@@ -470,6 +483,8 @@ def analyze_prune_breakdown(
                 keep_cers.append(cer)
             if sim is not None:
                 keep_sims.append(sim)
+        else:
+            missing_n += 1
 
     ds_rows = []
     for ds, info in sorted(by_dataset.items()):
@@ -506,12 +521,13 @@ def analyze_prune_breakdown(
         )
 
     return {
-        "rules": f"DELETE: CER > {max_cer} OR SIM < {min_sim}; KEEP: otherwise",
+        "rules": f"DELETE: CER > {max_cer} OR SIM < {min_sim}; missing required eval is not KEEP",
         "max_cer": max_cer,
         "min_sim": min_sim,
         "total": total,
         "delete": delete_n,
         "keep": keep_n,
+        "missing_eval": missing_n,
         "delete_pct": round(100.0 * delete_n / total, 2) if total else 0.0,
         "keep_pct": round(100.0 * keep_n / total, 2) if total else 0.0,
         "delete_reasons": {

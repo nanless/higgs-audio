@@ -4,9 +4,8 @@ Ultra-diverse compact prompt for Higgs Audio v3.
 """
 
 import random
-from typing import Optional
-
-from .scenarios import EMOTION_PROFILES, EMOTIONS, LANG_MIX_SPECS, LENGTH_SPECS, SCENARIOS
+from .scenarios import EMOTION_PROFILES, LANG_MIX_SPECS, LENGTH_SPECS, SCENARIOS
+from .stable_random import stable_int
 from .tag_guide import build_tag_guide, validate_tag_combo
 from .tags import RECOMMENDED_COMBINATIONS
 
@@ -291,7 +290,7 @@ _TOPIC_SEEDS = {
 
 
 def _pick_axis(pool, batch_size, seed_str, suffix):
-    rng = random.Random(hash(f"{seed_str}|{suffix}") & 0xFFFFFFFF)
+    rng = random.Random(stable_int(seed_str, suffix, bits=32))
     shuffled = list(pool)
     rng.shuffle(shuffled)
     result = []
@@ -356,7 +355,7 @@ def build_compact_prompt(
     # Length mixing
     length_variants = [length_key] * (batch_size // 2)
     alt_lengths = [k for k in LENGTH_SPECS.keys() if k != length_key]
-    rng = random.Random(hash(f"{seed_str}|length") & 0xFFFFFFFF)
+    rng = random.Random(stable_int(seed_str, "length", bits=32))
     for _ in range(batch_size - len(length_variants)):
         length_variants.append(rng.choice(alt_lengths))
     rng.shuffle(length_variants)
@@ -364,7 +363,7 @@ def build_compact_prompt(
 
     # Emotion mixing: 50% primary, 30% secondary, 20% no emotion tag
     emo_assignments = [emotion] * (batch_size // 2)
-    rng2 = random.Random(hash(f"{seed_str}|emo") & 0xFFFFFFFF)
+    rng2 = random.Random(stable_int(seed_str, "emo", bits=32))
     for _ in range(max(0, batch_size // 3)):
         if secondary_emotions:
             emo_assignments.append(rng2.choice(secondary_emotions))
@@ -374,7 +373,7 @@ def build_compact_prompt(
     emo_assignments = emo_assignments[:batch_size]
 
     # Label count per item with weighted distribution
-    rng3 = random.Random(hash(f"{seed_str}|labels") & 0xFFFFFFFF)
+    rng3 = random.Random(stable_int(seed_str, "labels", bits=32))
     label_density_pop = []
     for count, prob in _LABEL_DENSITIES:
         label_density_pop.extend([count] * int(prob * 100))
@@ -382,7 +381,7 @@ def build_compact_prompt(
     label_counts = [rng3.choice(label_density_pop) for _ in range(batch_size)]
 
     # Label combo assignment per item
-    rng4 = random.Random(hash(f"{seed_str}|combo") & 0xFFFFFFFF)
+    rng4 = random.Random(stable_int(seed_str, "combo", bits=32))
     label_combos = []
     for i in range(batch_size):
         if label_counts[i] == 0:

@@ -3,8 +3,6 @@ Shared tag guide builder for Higgs Audio v3.
 Used by both compact_prompt.py and prompt_builder.py.
 """
 
-from typing import Optional
-
 from .scenarios import EMOTION_PROFILES
 from .tags import (
     EMOTION_TAGS,
@@ -52,7 +50,7 @@ def validate_tag_combo(tags):
     for tag in tags:
         for other in seen:
             pair = (tag, other)
-            if pair in _PROHIBITED_PAIRS:
+            if pair in _PROHIBITED_PAIRS or (other, tag) in _PROHIBITED_PAIRS:
                 return False, f"{tag} 与 {other} 互斥"
         seen.add(tag)
     return True, None
@@ -70,7 +68,6 @@ def build_tag_guide(emotion: str, is_cn: bool = True) -> str:
     """
     profile = EMOTION_PROFILES.get(emotion, EMOTION_PROFILES["enthusiasm"])
     primary = ", ".join(f"<|{t}|>" for t in profile["primary_tags"])
-    secondary = ", ".join(f"<|{t}|>" for t in profile["secondary_tags"][:2]) if profile["secondary_tags"] else "无"
     rec_combo = RECOMMENDED_COMBINATIONS.get(emotion, [])
     rec_combo_str = " + ".join(f"<|{c}|>" for c in rec_combo) if rec_combo else "无特定搭配"
     density = profile.get("tag_density", "medium")

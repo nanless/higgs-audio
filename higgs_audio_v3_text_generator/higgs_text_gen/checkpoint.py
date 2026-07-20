@@ -4,15 +4,27 @@ Checkpoint/resume logic for batch text generation.
 
 import json
 import os
+import tempfile
 from typing import Dict, List
 
 
 def save_checkpoint(texts: List[Dict], path: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for item in texts:
-            clean = {k: v for k, v in item.items() if not k.startswith("_")}
-            f.write(json.dumps(clean, ensure_ascii=False) + "\n")
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for item in texts:
+                clean = {k: v for k, v in item.items() if not k.startswith("_")}
+                f.write(json.dumps(clean, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 def load_checkpoint(path: str) -> List[Dict]:

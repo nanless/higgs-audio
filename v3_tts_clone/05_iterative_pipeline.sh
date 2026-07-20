@@ -50,6 +50,7 @@ fi
 EVAL_CER_DIR="${REPO_ROOT}/eval_higgs_audio/eval_cer"
 EVAL_SIM_DIR="${REPO_ROOT}/eval_higgs_audio/eval_sim"
 EVAL_DIR="${REPO_ROOT}/eval_higgs_audio"
+PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/higgs_v3_env/bin/python3}"
 
 # ---- 可配置参数 ----
 STATS_CSV="${STATS_CSV:-${REPO_ROOT}/clone_workdir/speaker_duration_stats_v2.csv}"
@@ -204,7 +205,7 @@ build_merged_sources() {
     export _PIPE_MERGED_ROOT="${merged_root}"
     export _PIPE_CSV_PATH="${csv_path}"
     export _PIPE_SRC_DIRS="${src_dirs[*]}"
-    python << 'PYEOF'
+    "${PYTHON_BIN}" << 'PYEOF'
 import os, csv, sys
 
 merged_root = os.environ.get('_PIPE_MERGED_ROOT', '')
@@ -463,7 +464,7 @@ else
 # Step 1b: 预算分配 (直接用原始 STATS_CSV; 04 自身扫描 --clone-root 计入 clone 时长, 避免双重计入)
 log_step "ALLOC" "预算分配 (total_clone_hours=${TOTAL_CLONE_HOURS})"
 run_or_fail "04_post_prune_stats" \
-    "python ${V3_CLONE_DIR}/04_post_prune_stats.py \
+    "${PYTHON_BIN} ${V3_CLONE_DIR}/04_post_prune_stats.py \
         --stats-csv ${STATS_CSV} \
         --clone-root ${CLONE_ROOT} \
         --output-dir ${ALLOC_DIR} \
@@ -477,12 +478,12 @@ if [ ! -f "${FULL_RESUME_CSV}" ]; then
 fi
 
 # Step 1c: 保存原始预算分配
-python ${V3_CLONE_DIR}/05_save_orig_allocation.py \
+"${PYTHON_BIN}" ${V3_CLONE_DIR}/05_save_orig_allocation.py \
     --resume-csv ${FULL_RESUME_CSV} \
     --out-json ${ORIG_CLONES_JSON}
 fi
 
-TOTAL_NEEDED=$(python -c "import json; print(sum(v['clones_needed'] for v in json.load(open('${ORIG_CLONES_JSON}')).values()))")
+TOTAL_NEEDED=$("${PYTHON_BIN}" -c "import json; print(sum(v['clones_needed'] for v in json.load(open('${ORIG_CLONES_JSON}')).values()))")
 echo "  每轮克隆约: $(( TOTAL_NEEDED / TOTAL_ROUNDS )) (共 ${TOTAL_ROUNDS} 轮)"
 
 # ====================================================================
@@ -519,7 +520,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
 
     # ---- 扫描磁盘，获取每个说话人的实际现有 clone 数量 (始终执行, 作为本轮基线) ----
     log_step "SCAN" "扫描磁盘现有 clone"
-    python ${V3_CLONE_DIR}/05_scan_existing_clones.py \
+    "${PYTHON_BIN}" ${V3_CLONE_DIR}/05_scan_existing_clones.py \
         --clone-root ${CLONE_ROOT} \
         --resume-csv ${FULL_RESUME_CSV} \
         --workers ${SCAN_WORKERS} \
@@ -542,7 +543,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
             MERGED_ARG=""
         fi
         run_or_fail "生成本轮 CSV" \
-            "python ${V3_CLONE_DIR}/05_generate_round_csv.py \
+            "${PYTHON_BIN} ${V3_CLONE_DIR}/05_generate_round_csv.py \
                 --orig-json ${ORIG_CLONES_JSON} \
                 --existing-json ${EXISTING_CLONES_JSON} \
                 --resume-csv ${FULL_RESUME_CSV} \
@@ -551,7 +552,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --out-csv ${ROUND_CSV}"
 
         # 检查是否有待克隆项 (为 0 时跳过 TTS/克隆, 仍跑 SIM/CER 以便补评)
-        has_clones=$(python -c "import csv; rows=csv.DictReader(open('${ROUND_CSV}','r')); print(sum(int(r.get('clones_needed',0)) for r in rows))") 2>/dev/null || true
+        has_clones=$("${PYTHON_BIN}" -c "import csv; rows=csv.DictReader(open('${ROUND_CSV}','r')); print(sum(int(r.get('clones_needed',0)) for r in rows))") 2>/dev/null || true
         if [ "${has_clones:-0}" = "0" ]; then
             echo "✅ 本轮无需克隆，所有说话人已达预算上限 (仍继续 SIM/CER)"
         else
@@ -588,7 +589,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
         # 即使尾部被剪枝的编号在下一轮被复用, 文本/参考也会不同; 同一轮内仍确定, 支持断点续跑。
         ROUND_SEED=$(( SEED + round * 1000000 ))
         run_or_fail "Round ${round} 克隆 (seed=${ROUND_SEED})" \
-            "python ${V3_CLONE_DIR}/03_tts_clone.py \
+            "${PYTHON_BIN} ${V3_CLONE_DIR}/03_tts_clone.py \
                 --stats-csv ${ROUND_CSV} \
                 --texts-jsonl ${TEXTS_JSONL} \
                 --output-root ${CLONE_ROOT} \
@@ -617,13 +618,14 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
     # 先跑快的 SIM, 用 SIM 删一波 (缩小后面昂贵的 ASR/CER 工作量)
     if [ "${cur_start_level}" -le 2 ]; then
         # 全部 GPU (ALL_GPUS), 每次全新 os.walk 扫描
+        SIM_EVAL_FAILED=0
         run_or_fail "SIM 评估" \
             "bash ${EVAL_SIM_DIR}/run_eval_sim.sh \
                 --out-dir ${CLONE_ROOT} \
                 --skip-existing \
                 --gpus ${ALL_GPUS} \
                 --scan-workers ${SCAN_WORKERS} \
-                --workers ${SIM_WORKERS}" || { echo "⚠️  SIM 评估失败，跳过 SIM 剪枝，继续 CER"; PIPELINE_FAILED=1; }
+                --workers ${SIM_WORKERS}" || SIM_EVAL_FAILED=1
 
         # 释放 SIM 占用的 GPU: 杀主进程 + 回收孤儿 spawn worker (omnivoice env)
         pkill -f "eval_sim.py" 2>/dev/null || true
@@ -631,18 +633,26 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
         reap_orphans "omnivoice/bin/python"
         sleep 3
         echo "  ✅ SIM 评估进程已释放 GPU"
+        if [ "${SIM_EVAL_FAILED}" -ne 0 ]; then
+            echo "❌ SIM 评估失败：质量门禁采用 fail-closed，本轮停止且不执行剪枝"
+            exit 1
+        fi
 
         # SIM 剪枝: 只按 SIM 删 (--max-cer 999 关闭 CER 判定), 缩小 CER 待评估集
         log_step "PRUNE-SIM" "SIM 剪枝 (SIM<${MIN_SIM}, 先删一波再跑 ASR)"
         run_or_fail "Prune(SIM)" \
-            "python ${EVAL_DIR}/prune_and_copy.py \
+            "${PYTHON_BIN} ${EVAL_DIR}/prune_and_copy.py \
                 --out-dir ${CLONE_ROOT} \
                 --max-cer 999 \
                 --min-sim ${MIN_SIM} \
+                --no-require-cer \
                 --eval-source sidecar \
                 --eval-workers ${PRUNE_WORKERS} \
                 --scan-workers ${SCAN_WORKERS} \
-                --workers ${PRUNE_WORKERS}" || { echo "⚠️  SIM 剪枝失败，继续 CER"; PIPELINE_FAILED=1; }
+                --workers ${PRUNE_WORKERS}" || {
+                    echo "❌ SIM 剪枝失败或存在缺失评估：本轮停止"
+                    exit 1
+                }
     else
         echo "  ⏭  跳过 SIM 评估/剪枝 (START_STEP=${START_STEP}), 复用已有 .sim.json"
     fi
@@ -659,6 +669,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
             CER_BATCH="${ASR_BATCH_SIZE}"
             LANG_GROUP_ARG="--group-by-language"
         fi
+        CER_EVAL_FAILED=0
         run_or_fail "CER 评估" \
             "bash ${EVAL_CER_DIR}/run_eval_cer.sh \
                 --out-dir ${CLONE_ROOT} \
@@ -671,7 +682,7 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
                 --batch-size ${CER_BATCH} \
                 --audio-workers ${ASR_AUDIO_WORKERS} \
                 --asr-max-new-tokens ${ASR_MAX_NEW_TOKENS} \
-                ${LANG_GROUP_ARG}" || { echo "⚠️  CER 评估失败，跳过 CER 剪枝，继续下一轮"; PIPELINE_FAILED=1; }
+                ${LANG_GROUP_ARG}" || CER_EVAL_FAILED=1
 
         # 释放 CER (ASR) 占用的 GPU: 杀主进程 + 回收孤儿 vllm/spawn worker (qwen3-asr env)
         pkill -f "eval_cer.py" 2>/dev/null || true
@@ -679,30 +690,37 @@ for round in $(seq 1 ${TOTAL_ROUNDS}); do
         reap_orphans "qwen3-asr/bin/python"
         sleep 3
         echo "  ✅ CER 评估进程已释放 GPU"
+        if [ "${CER_EVAL_FAILED}" -ne 0 ]; then
+            echo "❌ CER 评估失败：质量门禁采用 fail-closed，本轮停止且不执行剪枝"
+            exit 1
+        fi
 
         # CER 剪枝: 完整阈值 (SIM 存活里再删 CER>${MAX_CER}; SIM 已合格)
         log_step "PRUNE-CER" "CER 剪枝 (CER>${MAX_CER} 或 SIM<${MIN_SIM})"
         run_or_fail "Prune(CER)" \
-            "python ${EVAL_DIR}/prune_and_copy.py \
+            "${PYTHON_BIN} ${EVAL_DIR}/prune_and_copy.py \
                 --out-dir ${CLONE_ROOT} \
                 --max-cer ${MAX_CER} \
                 --min-sim ${MIN_SIM} \
                 --eval-source sidecar \
                 --eval-workers ${PRUNE_WORKERS} \
                 --scan-workers ${SCAN_WORKERS} \
-                --workers ${PRUNE_WORKERS}" || { echo "⚠️  CER 剪枝失败，继续下一轮"; PIPELINE_FAILED=1; }
+                --workers ${PRUNE_WORKERS}" || {
+                    echo "❌ CER 剪枝失败或存在缺失评估：本轮停止"
+                    exit 1
+                }
     else
         echo "  ⏭  跳过 CER 评估/剪枝 (START_STEP=${START_STEP}), 复用已有 .cer.json"
     fi
 
     # 剪枝后统计本轮保留多少
     log_step "STATS" "本轮后统计"
-    python ${V3_CLONE_DIR}/05_scan_existing_clones.py \
+    "${PYTHON_BIN}" ${V3_CLONE_DIR}/05_scan_existing_clones.py \
         --clone-root ${CLONE_ROOT} \
         --resume-csv ${FULL_RESUME_CSV} \
         --workers ${SCAN_WORKERS} \
         --out-json ${ROUND_DIR}/existing_clones_after.json
-    python -c "
+    "${PYTHON_BIN}" -c "
 import json
 b=json.load(open('${EXISTING_CLONES_JSON}')); a=json.load(open('${ROUND_DIR}/existing_clones_after.json'))
 tb=sum(b.values()); ta=sum(a.values()); d=ta-tb
@@ -723,7 +741,7 @@ echo "  日志: ${LOG_FILE}"
 echo "=============================================="
 
 log_step "FINAL" "最终克隆统计"
-python ${V3_CLONE_DIR}/04_post_prune_stats.py \
+"${PYTHON_BIN}" ${V3_CLONE_DIR}/04_post_prune_stats.py \
     --stats-csv ${STATS_CSV} \
     --clone-root ${CLONE_ROOT} \
     --output-dir ${PIPELINE_WORKDIR}/final \
@@ -732,7 +750,7 @@ python ${V3_CLONE_DIR}/04_post_prune_stats.py \
     --estimate-clone-duration ${ESTIMATE_CLONE_DURATION}
 
 log_step "FINAL" "最终质量验证"
-if ! python ${EVAL_DIR}/verify_kept_clones.py --out-dir ${CLONE_ROOT} \
+if ! "${PYTHON_BIN}" ${EVAL_DIR}/verify_kept_clones.py --out-dir ${CLONE_ROOT} \
     --min-sim ${MIN_SIM} --max-cer ${MAX_CER} \
     --eval-source sidecar --eval-workers ${PRUNE_WORKERS}; then
     echo "⚠️  verify_kept_clones 未通过"
@@ -748,7 +766,7 @@ for rpad in $(seq -w 1 ${TOTAL_ROUNDS}); do
     round_dir="${PIPELINE_WORKDIR}/round_${rpad}"
     after_json="${round_dir}/existing_clones_after.json"
     if [ -f "${after_json}" ]; then
-        count=$(python -c "import json;print(sum(json.load(open('${after_json}')).values()))")
+        count=$("${PYTHON_BIN}" -c "import json;print(sum(json.load(open('${after_json}')).values()))")
         echo "  第 ${rpad} 轮后: ${count} 条 clone"
     fi
 done
